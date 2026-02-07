@@ -14,7 +14,7 @@ import time
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
-from typing import Literal, get_type_hints
+from typing import Any, Literal, get_type_hints
 from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
@@ -105,7 +105,7 @@ TOOL_CLASS_LIMITS = {
     "intrusive": threading.Semaphore(int(_env("MAX_INTRUSIVE_PARALLEL", "4"))),
 }
 
-METRICS = {
+METRICS: dict[str, Any] = {
     "calls_total": 0,
     "success_total": 0,
     "failures_total": 0,
@@ -263,7 +263,7 @@ def _validate_transport_auth_configuration() -> None:
                 raise RuntimeError(f"mTLS file not found: {required}")
 
 
-def _setdefault_tool_metrics(tool_name: str) -> dict:
+def _setdefault_tool_metrics(tool_name: str) -> dict[str, int]:
     per_tool = METRICS["per_tool"]
     if tool_name not in per_tool:
         per_tool[tool_name] = {
@@ -355,7 +355,7 @@ def _instrument_tool(tool_name: str, tool_level: Literal["passive", "active", "i
     return decorator
 
 
-ARG_TOKEN_RE = r"^[A-Za-z0-9._:/=,+-]+$"
+ARG_TOKEN_RE = r"^[A-Za-z0-9._:/=,+-]+$"  # nosec B105
 RAW_TOOL_ARG_ALLOW_PREFIX = {
     "nmap": ["-s", "-p", "-Pn", "-T", "--top-ports", "--script"],
     "gobuster": ["dir", "-u", "-w", "-t", "--no-error", "-x", "-k"],
@@ -1113,7 +1113,7 @@ def main() -> None:
             import uvicorn
 
             app = mcp.streamable_http_app()
-            uvicorn_kwargs = {
+            uvicorn_kwargs: dict[str, Any] = {
                 "host": HTTP_HOST,
                 "port": HTTP_PORT,
                 "log_level": _env("UVICORN_LOG_LEVEL", "info"),

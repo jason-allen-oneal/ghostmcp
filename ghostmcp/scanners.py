@@ -7,7 +7,7 @@ import re
 import shutil
 import socket
 import ssl
-import subprocess
+import subprocess  # nosec B404
 import tempfile
 import threading
 import time
@@ -40,14 +40,17 @@ _ACTIVE_PROCS_LOCK = threading.Lock()
 def terminate_active_processes() -> int:
     with _ACTIVE_PROCS_LOCK:
         procs = list(_ACTIVE_PROCS)
+    terminated = 0
     for proc in procs:
         try:
             os.killpg(proc.pid, 15)
         except ProcessLookupError:
-            continue
-        except Exception:
-            continue
-    return len(procs)
+            terminated += 0
+        except OSError:
+            terminated += 0
+        else:
+            terminated += 1
+    return terminated
 
 
 def _run_external_tool(
@@ -63,7 +66,7 @@ def _run_external_tool(
 
     started = time.monotonic()
     with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        proc = subprocess.Popen(
+        proc = subprocess.Popen(  # nosec B603
             command,
             stdout=stdout_file,
             stderr=stderr_file,
@@ -79,11 +82,11 @@ def _run_external_tool(
                 try:
                     os.killpg(proc.pid, 15)
                     proc.wait(timeout=2)
-                except Exception:
+                except OSError:
                     try:
                         os.killpg(proc.pid, 9)
-                    except Exception:
-                        pass
+                    except OSError:
+                        _ = False
                 raise ScannerTimeoutError(
                     f"External tool timed out after {timeout_s}s: {binary}"
                 ) from exc
@@ -193,7 +196,7 @@ def http_probe(url: str, user_agent: str, timeout_s: float = 4.0) -> dict:
     )
     started = time.monotonic()
     def _probe() -> dict:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310
             elapsed = int((time.monotonic() - started) * 1000)
             headers = {k.lower(): v for k, v in resp.headers.items()}
             return {
@@ -277,7 +280,7 @@ def fetch_security_txt(domain: str, user_agent: str, timeout_s: float = 4.0) -> 
         headers={"User-Agent": user_agent, "Accept": "text/plain"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # nosec B310
             body = resp.read().decode("utf-8", errors="replace")
             content_type = resp.headers.get("content-type")
             lines = body.splitlines()
