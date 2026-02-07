@@ -15,7 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 @dataclass
@@ -162,7 +162,7 @@ def reverse_dns(ip: str) -> str:
 
 def whois_query(target: str, timeout_s: float = 4.0) -> str:
     server = "whois.iana.org"
-    query = f"{target}\r\n".encode("utf-8")
+    query = f"{target}\r\n".encode()
 
     def _query() -> str:
         with socket.create_connection((server, 43), timeout=timeout_s) as sock:
@@ -252,12 +252,12 @@ def tls_certificate_expiry(host: str, port: int = 443, timeout_s: float = 4.0) -
         raise ScannerError("Certificate notAfter field is unavailable")
     try:
         expires_at = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z").replace(
-            tzinfo=timezone.utc
+            tzinfo=UTC
         )
     except ValueError as exc:
         raise ScannerError("Unable to parse certificate expiration timestamp") from exc
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     seconds_remaining = (expires_at - now).total_seconds()
     days_remaining = int(seconds_remaining // 86400)
     return {
@@ -551,7 +551,7 @@ def port_scan(
             results.append(future.result())
 
     results.sort(key=lambda item: item.port)
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     return {
         "host": host,
         "scanned_at": now,

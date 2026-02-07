@@ -1,6 +1,6 @@
-import unittest
 import sys
 import types
+import unittest
 
 if "mcp.server.fastmcp" not in sys.modules:
     mcp_module = types.ModuleType("mcp")

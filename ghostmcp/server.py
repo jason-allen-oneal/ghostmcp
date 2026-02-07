@@ -5,18 +5,17 @@ import inspect
 import json
 import logging
 import os
+import shutil
 import signal
 import ssl
-import shutil
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from functools import wraps
-from typing import get_type_hints
-from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal, get_type_hints
 from urllib.parse import urlparse
-from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 
@@ -26,6 +25,7 @@ from .rate_limit import SlidingWindowRateLimiter
 from .scanners import (
     ScannerError,
     ScannerTimeoutError,
+    amass_passive_enum,
     dns_lookup,
     extract_iocs,
     fetch_security_txt,
@@ -33,20 +33,19 @@ from .scanners import (
     generate_subdomain_candidates,
     gobuster_dir_scan,
     http_probe,
-    amass_passive_enum,
-    nmap_service_scan,
     nikto_scan,
+    nmap_service_scan,
     port_scan,
     reverse_dns,
     run_external_binary,
     sslscan_target,
+    terminate_active_processes,
     tls_certificate,
     tls_certificate_expiry,
     url_risk_score,
     wafw00f_scan,
     whatweb_scan,
     whois_query,
-    terminate_active_processes,
 )
 from .security import SecurityPolicy
 
@@ -64,7 +63,7 @@ rate_limiter = SlidingWindowRateLimiter(
     max_calls=int(_env("RATE_LIMIT_CALLS", "120")),
     window_seconds=int(_env("RATE_LIMIT_WINDOW_SECONDS", "60")),
 )
-STARTED_AT = datetime.now(timezone.utc)
+STARTED_AT = datetime.now(UTC)
 
 mcp = FastMCP(
     "ghostmcp-tooling",
@@ -463,7 +462,8 @@ def _install_signal_handlers() -> None:
                 file=sys.stderr,
                 flush=True,
             )
-        raise SystemExit(130 if signum == signal.SIGINT else 143)
+        # FastMCP/transport loops may swallow SystemExit; force process teardown.
+        os._exit(130 if signum == signal.SIGINT else 143)
 
     signal.signal(signal.SIGINT, _handle_shutdown)
     signal.signal(signal.SIGTERM, _handle_shutdown)
@@ -518,7 +518,7 @@ def _audit_tool_call(
     target: str | None = None,
 ) -> None:
     global _last_audit_hash
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     with _audit_lock:
         payload = {
             "ts": now,
@@ -1011,7 +1011,7 @@ def runtime_probe_tool(
     return {
         "status": "ready" if not _shutdown_event.is_set() else "stopping",
         "started_at": STARTED_AT.isoformat(),
-        "uptime_seconds": int((datetime.now(timezone.utc) - STARTED_AT).total_seconds()),
+        "uptime_seconds": int((datetime.now(UTC) - STARTED_AT).total_seconds()),
         "transport_mode": TRANSPORT_MODE,
         "auth_mode": AUTH_MODE,
         "tool_count_enabled": len(ENABLED_BINARY_MCP_TOOLS) + 16,
@@ -1056,7 +1056,7 @@ def server_health_tool(
         },
         "runtime": {
             "started_at": STARTED_AT.isoformat(),
-            "uptime_seconds": int((datetime.now(timezone.utc) - STARTED_AT).total_seconds()),
+            "uptime_seconds": int((datetime.now(UTC) - STARTED_AT).total_seconds()),
             "shutting_down": _shutdown_event.is_set(),
         },
     }
@@ -1093,7 +1093,7 @@ def main() -> None:
         "                     ▐▌                  ",
         "=========================================",
         " Server Started",
-        f" Server ID: ghostmcp-tooling",
+        " Server ID: ghostmcp-tooling",
         f" Transport: {'stdio' if TRANSPORT_MODE == 'stdio' else 'streamable-http'}",
         f" PID: {os.getpid()}",
         f" Tools enabled: {total_enabled_tools}/{total_tool_count}",

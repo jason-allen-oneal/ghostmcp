@@ -1,6 +1,6 @@
-import unittest
 import sys
 import types
+import unittest
 from unittest.mock import patch
 
 if "mcp.server.fastmcp" not in sys.modules:
@@ -28,20 +28,20 @@ if "mcp.server.fastmcp" not in sys.modules:
 
 from ghostmcp.security import ValidationResult
 from ghostmcp.server import (
-    common_web_paths_tool,
-    ioc_extract_tool,
     amass_passive_tool,
+    common_web_paths_tool,
     gobuster_dir_tool,
+    ioc_extract_tool,
     nikto_tool,
     nmap_service_scan_tool,
-    sslscan_tool,
-    wafw00f_tool,
-    whatweb_tool,
     security_txt_tool,
+    sslscan_tool,
     subdomain_candidates_tool,
     tls_certificate_expiry_tool,
     toolchain_status_tool,
     url_risk_score_tool,
+    wafw00f_tool,
+    whatweb_tool,
 )
 
 
