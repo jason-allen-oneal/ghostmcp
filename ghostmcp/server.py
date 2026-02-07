@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -10,6 +11,8 @@ import shutil
 import sys
 import threading
 import time
+from functools import wraps
+from typing import get_type_hints
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -312,6 +315,10 @@ def _record_call_result(
 
 def _instrument_tool(tool_name: str, tool_level: Literal["passive", "active", "intrusive"]):
     def decorator(fn):
+        fn_signature = inspect.signature(fn)
+        resolved_hints = get_type_hints(fn, globalns=fn.__globals__, include_extras=True)
+
+        @wraps(fn)
         def wrapped(*args, **kwargs):
             _record_call_start(tool_name)
             started = time.monotonic()
@@ -330,8 +337,20 @@ def _instrument_tool(tool_name: str, tool_level: Literal["passive", "active", "i
             _record_call_result(tool_name, success=True, duration_ms=duration_ms)
             return result
 
-        wrapped.__name__ = fn.__name__
-        wrapped.__doc__ = fn.__doc__
+        # FastMCP inspects function signatures for tool schemas; preserve original params.
+        resolved_params = []
+        for name, param in fn_signature.parameters.items():
+            annotation = resolved_hints.get(name, param.annotation)
+            resolved_params.append(param.replace(annotation=annotation))
+        resolved_return = resolved_hints.get("return", fn_signature.return_annotation)
+        wrapped.__signature__ = fn_signature.replace(  # type: ignore[attr-defined]
+            parameters=resolved_params,
+            return_annotation=resolved_return,
+        )
+        wrapped.__annotations__ = {
+            **{k: v for k, v in resolved_hints.items() if k != "return"},
+            "return": resolved_return,
+        }
         return wrapped
 
     return decorator
