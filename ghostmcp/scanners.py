@@ -228,6 +228,7 @@ def tls_certificate(host: str, port: int = 443, timeout_s: float = 4.0) -> dict:
     ctx = ssl.create_default_context()
     # Ensure only modern TLS versions are used (prefer TLS 1.2+).
     if hasattr(ssl, "TLSVersion"):
+        # Python 3.7+: explicitly disallow TLSv1 and TLSv1.1 by setting a minimum version.
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     else:
         # Fallback for older Python/OpenSSL: disable TLSv1 and TLSv1.1 explicitly if available.
