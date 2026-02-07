@@ -226,6 +226,15 @@ def http_probe(url: str, user_agent: str, timeout_s: float = 4.0) -> dict:
 
 def tls_certificate(host: str, port: int = 443, timeout_s: float = 4.0) -> dict:
     ctx = ssl.create_default_context()
+    # Ensure only modern TLS versions are used (prefer TLS 1.2+).
+    if hasattr(ssl, "TLSVersion"):
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    else:
+        # Fallback for older Python/OpenSSL: disable TLSv1 and TLSv1.1 explicitly if available.
+        if hasattr(ssl, "OP_NO_TLSv1"):
+            ctx.options |= ssl.OP_NO_TLSv1
+        if hasattr(ssl, "OP_NO_TLSv1_1"):
+            ctx.options |= ssl.OP_NO_TLSv1_1
     with socket.create_connection((host, port), timeout=timeout_s) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
             cert = tls_sock.getpeercert()
