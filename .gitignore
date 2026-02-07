@@ -16,7 +16,6 @@ venv/
 htmlcov/
 
 # Build / packaging artifacts
-.github/
 build/
 dist/
 *.egg-info/

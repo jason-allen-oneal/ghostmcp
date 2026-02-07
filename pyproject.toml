@@ -9,7 +9,7 @@ description = "Production-ready cybersecurity tooling MCP server for AI agents"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "GhostMCP" }]
-license = { text = "MIT" }
+license = "MIT"
 dependencies = [
   "mcp>=1.2.0",
 ]
@@ -49,3 +49,6 @@ warn_unused_ignores = true
 warn_redundant_casts = true
 warn_unreachable = true
 exclude = ["^tests/"]
+
+[tool.setuptools]
+packages = ["ghostmcp"]
