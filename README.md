@@ -1,4 +1,5 @@
 # GhostMCP
+[![CI](https://github.com/jason-allen-oneal/ghostmcp/actions/workflows/ci.yml/badge.svg)](https://github.com/jason-allen-oneal/ghostmcp/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/jason-allen-oneal/ghostmcp/actions/workflows/codeql.yml/badge.svg)](https://github.com/jason-allen-oneal/ghostmcp/actions/workflows/codeql.yml)
 [![Dependabot Updates](https://github.com/jason-allen-oneal/ghostmcp/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/jason-allen-oneal/ghostmcp/actions/workflows/dependabot/dependabot-updates)
 
