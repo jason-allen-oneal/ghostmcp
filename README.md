@@ -1,4 +1,6 @@
 # GhostMCP
+[![CodeQL](https://github.com/jason-allen-oneal/ghostmcp/actions/workflows/codeql.yml/badge.svg)](https://github.com/jason-allen-oneal/ghostmcp/actions/workflows/codeql.yml)
+[![Dependabot Updates](https://github.com/jason-allen-oneal/ghostmcp/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/jason-allen-oneal/ghostmcp/actions/workflows/dependabot/dependabot-updates)
 
 GhostMCP is a production-oriented MCP server for authorized red-team and security operations.
 
