@@ -1,0 +1,15 @@
+#include <tunables/global>
+
+profile ghostmcp /usr/bin/python3 {
+  #include <abstractions/base>
+  network,
+  capability net_raw,
+
+  /usr/bin/python3 mr,
+  /usr/lib/** r,
+  /app/** r,
+  /tmp/** rw,
+
+  deny /bin/sh x,
+  deny /usr/bin/sudo x,
+}
