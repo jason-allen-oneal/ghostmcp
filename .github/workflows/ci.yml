@@ -68,7 +68,7 @@ jobs:
         run: docker build -t ghostmcp:ci -f deploy/container/Dockerfile .
 
       - name: Scan image (Trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.34.0
         with:
           image-ref: ghostmcp:ci
           format: table
