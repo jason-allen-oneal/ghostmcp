@@ -42,7 +42,7 @@ async def lifespan(_app: FastAPI):
         _worker = None
 
 
-app = FastAPI(title="GhostMCP Dashboard", version="0.2.0a1", lifespan=lifespan)
+app = FastAPI(title="GhostMCP Dashboard", version="0.2.0", lifespan=lifespan)
 
 # Templates
 template_dir = Path(__file__).parent / "templates"

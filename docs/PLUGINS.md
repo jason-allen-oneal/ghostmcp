@@ -73,7 +73,7 @@ Declare the entry point in `pyproject.toml`:
 [project]
 name = "ghostmcp-plugin-example"
 version = "0.1.0"
-dependencies = ["ghostmcp-server>=0.2.0a1"]
+dependencies = ["ghostmcp-server>=0.2.0"]
 
 [project.entry-points."ghostmcp.plugins"]
 my-approved-plugin = "ghostmcp_plugin_example:ExamplePlugin"

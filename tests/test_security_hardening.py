@@ -13,12 +13,17 @@ class SecurityHardeningTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy.validate_masscan_targets("8.8.8.0/24")
 
-    def test_masscan_accepts_private_cidr(self) -> None:
+    def test_masscan_accepts_bounded_private_cidr(self) -> None:
         policy = SecurityPolicy(ServerConfig())
         self.assertEqual(
-            policy.validate_masscan_targets("10.10.0.0/16"),
-            "10.10.0.0/16",
+            policy.validate_masscan_targets("10.10.0.0/24"),
+            "10.10.0.0/24",
         )
+
+    def test_masscan_rejects_target_set_above_cardinality_limit(self) -> None:
+        policy = SecurityPolicy(ServerConfig(max_target_addresses=4096))
+        with self.assertRaises(ValueError):
+            policy.validate_masscan_targets("10.10.0.0/16")
 
     def test_masscan_range_must_fit_allowed_cidr(self) -> None:
         policy = SecurityPolicy(

@@ -64,12 +64,12 @@ Optional external tools still depend on installed binaries and policy. A schedul
 
 ## File-backed tools
 
-File-backed operations are restricted to roots in `GHOSTMCP_ALLOWED_FILE_ROOTS`.
+File-backed operations are restricted to roots in `GHOSTMCP_ALLOWED_PATHS`.
 
 Linux example:
 
 ```bash
-export GHOSTMCP_ALLOWED_FILE_ROOTS=/srv/assessments:/var/lib/ghostmcp/uploads
+export GHOSTMCP_ALLOWED_PATHS=/srv/assessments:/var/lib/ghostmcp/uploads
 ```
 
 The separator is the platform path separator. Keep writable upload locations separate from code, configuration, key files, and audit storage.
@@ -104,7 +104,7 @@ This does not make the in-memory work queue durable:
 - Work already placed into the process queue is lost if that process exits before execution.
 - A process restart does not reconstruct queued work automatically.
 
-For the current alpha release, run one dashboard instance. A durable external queue is required for multi-node or crash-resumable execution.
+For the current beta release, run one dashboard instance. A durable external queue is required for multi-node or crash-resumable execution.
 
 ## Backup and recovery
 
@@ -153,4 +153,4 @@ Check:
 
 ### A queued scan disappeared after restart
 
-That is a known alpha limitation. The queue is in process. Resubmit the scan after verifying that the previous process did not complete it.
+That is a known beta limitation. The queue is in process. Resubmit the scan after verifying that the previous process did not complete it.

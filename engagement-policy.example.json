@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0",
+  "engagements": {
+    "replace-with-engagement-id": {
+      "expires_at": "2099-01-01T00:00:00Z",
+      "max_tool_level": "intrusive",
+      "allowed_capabilities": [
+        "discovery"
+      ],
+      "allowed_cidrs": [
+        "10.40.0.0/24"
+      ],
+      "allowed_domains": [
+        "lab.example.internal"
+      ],
+      "allowed_paths": [],
+      "forbidden_paths": [
+        "/etc",
+        "/home"
+      ],
+      "allowed_resources": [],
+      "require_routed_execution": false,
+      "authorization": {
+        "approval_id": "replace-with-change-or-ticket-id",
+        "approved_by": "replace-with-approver-id",
+        "approved_at": "2026-07-25T00:00:00Z",
+        "reason": "Replace with the written authorization basis"
+      }
+    }
+  }
+}

@@ -38,7 +38,7 @@ Keep the MCP client's environment block explicit. Avoid inheriting unrelated cre
 
 ## Remote gateway
 
-Remote mode uses streamable HTTP. Bind to loopback or an internal interface and require token or mTLS authentication.
+Remote mode uses streamable HTTP. Bind to loopback or an internal interface and require token or mTLS authentication. Bearer-token mode on a non-loopback listener also requires direct TLS certificate and key paths.
 
 Token example:
 
@@ -132,6 +132,10 @@ docker run --rm \
   -e GHOSTMCP_TRANSPORT_MODE=remote_gateway \
   -e GHOSTMCP_AUTH_MODE=token \
   -e GHOSTMCP_AUTH_TOKEN="replace-with-a-long-random-token" \
+  -e GHOSTMCP_TLS_CERT_PATH=/run/ghostmcp/tls.crt \
+  -e GHOSTMCP_TLS_KEY_PATH=/run/ghostmcp/tls.key \
+  -v /etc/ghostmcp/tls.crt:/run/ghostmcp/tls.crt:ro \
+  -v /etc/ghostmcp/tls.key:/run/ghostmcp/tls.key:ro \
   -e GHOSTMCP_HTTP_HOST=0.0.0.0 \
   -e GHOSTMCP_HTTP_PORT=8000 \
   -e GHOSTMCP_DB_PATH=/var/lib/ghostmcp/ghostmcp.db \
@@ -154,11 +158,11 @@ export GHOSTMCP_DASHBOARD_HOST=127.0.0.1
 export GHOSTMCP_DASHBOARD_PORT=8080
 export GHOSTMCP_DASHBOARD_TOKEN="replace-with-a-long-random-token"
 export GHOSTMCP_DB_PATH=/var/lib/ghostmcp/ghostmcp.db
-export GHOSTMCP_ALLOWED_FILE_ROOTS=/srv/assessments
+export GHOSTMCP_ALLOWED_PATHS=/srv/assessments
 ghostmcp-dashboard
 ```
 
-Put HTTPS in front of the dashboard before enabling `GHOSTMCP_DASHBOARD_SECURE_COOKIE=true`. The dashboard token should be different from the MCP transport token.
+Put HTTPS in front of the dashboard before enabling `GHOSTMCP_DASHBOARD_SECURE_COOKIE=true`. Non-loopback binding additionally requires `GHOSTMCP_DASHBOARD_TRUSTED_TLS_PROXY=true`; this is an explicit operator acknowledgement, not a TLS implementation. The dashboard token should be different from the MCP transport token.
 
 ## Upgrades
 
@@ -173,3 +177,9 @@ Before upgrading:
 7. Start one instance and verify migrations, tool registration, and audit continuity.
 
 Do not copy old environment files forward without reviewing new defaults.
+
+Machine-readable readiness:
+
+```bash
+ghostmcp --healthcheck
+```

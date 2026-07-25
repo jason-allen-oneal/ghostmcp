@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import ipaddress
 import logging
-import os
 import queue
 import shutil
 import threading
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .config import ServerConfig, load_config
+from .config import load_config
 from .database import Database, Engagement, Scan
 from .scanners import (
     amass_passive_enum,
@@ -93,7 +92,10 @@ def _wordlist_url_runner(function: Callable[..., dict[str, Any]]):
         policy.validate_url(target)
         if "wordlist" not in params:
             return function(target)
-        return function(target, wordlist=str(_local_path(str(params["wordlist"]))))
+        return function(
+            target,
+            wordlist=str(_local_path(policy, str(params["wordlist"]))),
+        )
 
     return run
 
@@ -105,7 +107,9 @@ def _gobuster_runner(
     policy.validate_url(target)
     kwargs: dict[str, Any] = {}
     if "wordlist" in params:
-        kwargs["wordlist"] = str(_local_path(str(params["wordlist"])))
+        kwargs["wordlist"] = str(
+            _local_path(policy, str(params["wordlist"]))
+        )
     if "threads" in params:
         threads = int(params["threads"])
         if threads < 1 or threads > 64:
@@ -122,7 +126,9 @@ def _nuclei_runner(
     templates = params.get("templates")
     if templates is None:
         return nuclei_scan(target)
-    return nuclei_scan(target, templates=str(_local_path(str(templates))))
+    return nuclei_scan(
+        target, templates=str(_local_path(policy, str(templates)))
+    )
 
 
 def _dnsrecon_runner(
@@ -156,26 +162,18 @@ def _sslscan_runner(
     return sslscan_target(validated.host, port=port)
 
 
-def _local_path(target: str) -> Path:
-    roots = [
-        Path(value).expanduser().resolve()
-        for value in os.getenv("GHOSTMCP_ALLOWED_FILE_ROOTS", "").split(os.pathsep)
-        if value.strip()
-    ]
-    if not roots:
-        raise ValueError("Local file tools require GHOSTMCP_ALLOWED_FILE_ROOTS")
+def _local_path(policy: SecurityPolicy, target: str) -> Path:
     candidate = Path(target).expanduser().resolve(strict=True)
-    if not any(candidate == root or root in candidate.parents for root in roots):
-        raise ValueError("Local path is outside configured roots")
+    policy.validate_path(str(candidate))
     return candidate
 
 
 def _file_runner(function: Callable[..., dict[str, Any]]):
     def run(
-        _policy: SecurityPolicy, target: str, params: dict[str, Any]
+        policy: SecurityPolicy, target: str, params: dict[str, Any]
     ) -> dict[str, Any]:
         _reject_unknown_params(params, set())
-        return function(str(_local_path(target)))
+        return function(str(_local_path(policy, target)))
 
     return run
 
@@ -238,17 +236,51 @@ def available_dashboard_tools() -> list[str]:
 
 def _engagement_policy(engagement: Engagement) -> SecurityPolicy:
     base = load_config()
+    base_policy = SecurityPolicy(base)
+    if base.engagement_policy_file is not None:
+        scoped = base_policy.for_engagement(engagement.id)
+        if (
+            TOOL_LEVELS[engagement.max_tool_level]
+            > TOOL_LEVELS[scoped.config.max_tool_level]
+        ):
+            raise PermissionError(
+                "Dashboard engagement exceeds policy-backed tool ceiling"
+            )
+        return scoped
+    if (
+        engagement.max_tool_level == "intrusive"
+        and not base.allow_unscoped_intrusive
+    ):
+        raise PermissionError(
+            "Intrusive dashboard execution requires a policy-backed engagement"
+        )
+    if TOOL_LEVELS[engagement.max_tool_level] > TOOL_LEVELS[base.max_tool_level]:
+        raise PermissionError(
+            "Dashboard engagement exceeds the server tool ceiling"
+        )
     cidrs = tuple(
         ipaddress.ip_network(value, strict=False) for value in engagement.scope_cidrs
     )
-    config: ServerConfig = replace(
-        base,
-        allowed_cidrs=cidrs or base.allowed_cidrs,
-        allowed_domains=tuple(engagement.scope_domains) or base.allowed_domains,
-        max_tool_level=engagement.max_tool_level,
-        require_engagement_context=True,
+    if not cidrs and not engagement.scope_domains:
+        raise PermissionError(
+            "Dashboard engagement requires an explicit CIDR or domain scope"
+        )
+    return base_policy.narrow(
+        {
+            "allowed_cidrs": [
+                str(item) for item in (cidrs or base.allowed_cidrs)
+            ],
+            "allowed_domains": (
+                list(engagement.scope_domains)
+                or list(base.allowed_domains)
+            ),
+            "allowed_paths": [str(item) for item in base.allowed_paths],
+            "forbidden_paths": [str(item) for item in base.forbidden_paths],
+            "allowed_resources": list(base.allowed_resources),
+            "allowed_capabilities": list(base.allowed_capabilities),
+            "max_tool_level": engagement.max_tool_level,
+        }
     )
-    return SecurityPolicy(config)
 
 
 class ScanExecutor:

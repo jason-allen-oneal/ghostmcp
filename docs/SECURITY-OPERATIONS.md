@@ -47,6 +47,7 @@ GHOSTMCP_ALLOWED_CIDRS=10.40.0.0/16
 GHOSTMCP_ALLOWED_DOMAINS=lab.example.internal
 GHOSTMCP_REQUIRE_ENGAGEMENT_CONTEXT=true
 GHOSTMCP_MAX_TOOL_LEVEL=active
+GHOSTMCP_ALLOW_UNSCOPED_INTRUSIVE=false
 ```
 
 Scope validation applies to literal addresses, DNS results, URLs, masscan expressions, CIDRs, and explicit address ranges. A hostname with any prohibited resolved address is rejected.
@@ -59,7 +60,9 @@ Avoid broad scopes such as `10.0.0.0/8` when a smaller subnet is known. Do not u
 - `active`: direct probing or bounded scanning
 - `intrusive`: behavior with greater operational or authentication impact
 
-The global ceiling and engagement ceiling both apply. Keep the global ceiling at `active`. Temporarily raising the global ceiling affects every engagement and should require a change record and operator review.
+The global ceiling and engagement ceiling both apply. The `engagement_mode` tool argument is a requested ceiling, not authorization. Intrusive and sensitive calls require a policy-backed scope with approval provenance unless the explicit unsafe compatibility override is enabled.
+
+Use [`engagement-policy.example.json`](../engagement-policy.example.json) as a schema example. Keep the real file mode `0600`, replace the example timestamps and identifiers, and grant only the capabilities and targets required by the engagement.
 
 ## Raw wrappers
 
@@ -106,7 +109,7 @@ For remote mode:
 - Otherwise use a long random bearer token.
 - Bind to loopback or an internal interface.
 - Restrict the port with a firewall or private overlay.
-- Terminate HTTPS at a trusted proxy if TLS is not handled directly.
+- Terminate HTTPS at a trusted proxy only with a loopback backend, or configure direct TLS.
 - Preserve and validate the `Authorization` header.
 - Do not enable unauthenticated remote mode.
 
@@ -119,8 +122,8 @@ Token authentication is enforced before MCP dispatch. Tokens are not tool argume
 - Enable secure cookies only behind HTTPS.
 - Preserve original host and scheme through reverse proxies.
 - Keep same-origin mutation checks enabled.
-- Restrict file-backed tools with `GHOSTMCP_ALLOWED_FILE_ROOTS`.
-- Run one dashboard instance for the alpha release.
+- Restrict file-backed tools with `GHOSTMCP_ALLOWED_PATHS`.
+- Run one dashboard instance for the beta release.
 
 The dashboard renders escaped report values and sends security headers, but operators should still avoid placing untrusted HTML or secrets into engagement descriptions and findings.
 
@@ -198,7 +201,7 @@ Drop container capabilities and enable `no-new-privileges`.
 
 Limit egress to authorized target networks, DNS resolvers, secret-manager endpoints, and required update sources. Application scope checks are not a replacement for network enforcement.
 
-Proxy and Tor modes change routing, not authorization. They should not be used to conceal unauthorized activity or bypass network controls.
+Proxy and Tor modes change routing, not authorization. Configured routing fails closed when its wrapper is unavailable. `GHOSTMCP_REQUIRE_ROUTED_EXECUTION=true` also denies direct-only tools. Routing must not be used to conceal unauthorized activity or bypass network controls.
 
 ## Dependency and image security
 
@@ -249,6 +252,8 @@ Before production use:
 - [ ] Written authorization is current.
 - [ ] CIDRs and domains are narrowly scoped.
 - [ ] Global maximum tool level is appropriate.
+- [ ] Intrusive/sensitive engagements have unexpired policy records and approval provenance.
+- [ ] Capability, filesystem, resource, and target-address ceilings are narrow.
 - [ ] Remote and dashboard authentication are tested.
 - [ ] Public binding is avoided or protected.
 - [ ] Raw-wrapper allowlist is reviewed.

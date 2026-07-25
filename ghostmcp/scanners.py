@@ -16,6 +16,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import BinaryIO
 
 from .audit import verify_audit_log
 from .parsers.amass import parse_amass_json
@@ -81,17 +83,23 @@ _SENSITIVE_VALUE_FLAGS = {
     "--token",
 }
 _SENSITIVE_PREFIXES = tuple(f"{flag}=" for flag in _SENSITIVE_VALUE_FLAGS)
+_BINARY_SENSITIVE_VALUE_FLAGS = {"smbmap": {"-p"}}
 
 
 def _redact_command(command: list[str]) -> list[str]:
     redacted: list[str] = []
     redact_next = False
+    binary_flags = (
+        _BINARY_SENSITIVE_VALUE_FLAGS.get(Path(command[0]).name, set())
+        if command
+        else set()
+    )
     for arg in command:
         if redact_next:
             redacted.append("<redacted>")
             redact_next = False
             continue
-        if arg in _SENSITIVE_VALUE_FLAGS:
+        if arg in _SENSITIVE_VALUE_FLAGS or arg in binary_flags:
             redacted.append(arg)
             redact_next = True
             continue
@@ -102,77 +110,146 @@ def _redact_command(command: list[str]) -> list[str]:
         redacted.append(arg)
     return redacted
 
+
+def _minimal_subprocess_env(proxy_env: dict[str, str] | None) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    env["HOME"] = "/nonexistent"
+    if proxy_env:
+        env.update(proxy_env)
+    return env
+
+
+def _drain_stream(
+    stream: BinaryIO,
+    limit: int,
+    chunks: list[bytes],
+    total: list[int],
+) -> None:
+    retained = 0
+    while True:
+        try:
+            data = stream.read(8192)
+        except (OSError, ValueError):
+            return
+        if not data:
+            return
+        total[0] += len(data)
+        if retained < limit:
+            chunk = data[: limit - retained]
+            chunks.append(chunk)
+            retained += len(chunk)
+
+
+def _terminate_process_group(proc: subprocess.Popen, grace_s: float = 2.0) -> None:
+    try:
+        os.killpg(proc.pid, 15)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=grace_s)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, 9)
+    except ProcessLookupError:
+        return
+    proc.wait(timeout=grace_s)
+
+
 def _run_external_tool(
     command: list[str],
     timeout_s: float = 120.0,
     max_stdout_bytes: int = 20000,
     max_stderr_bytes: int = 8000,
+    route: bool = True,
 ) -> dict:
-    # Apply proxy mode to command
-    command = apply_proxy_mode(command)
-    binary = command[0]
-    path = shutil.which(binary)
-    if not path:
-        raise ScannerError(f"Required tool is not installed: {binary}")
+    if not command:
+        raise ScannerError("External tool command is empty")
+    requested_binary = command[0]
+    if not shutil.which(requested_binary):
+        raise ScannerError(f"Required tool is not installed: {requested_binary}")
+    if route:
+        command = apply_proxy_mode(command)
+    if not shutil.which(command[0]):
+        raise ScannerError(f"Required execution wrapper is not installed: {command[0]}")
 
-    # Get proxy environment
-    proxy_env = get_proxy_env()
-    env = os.environ.copy()
-    if proxy_env:
-        env.update(proxy_env)
+    proxy_env = get_proxy_env() if route else None
+    env = _minimal_subprocess_env(proxy_env)
 
     started = time.monotonic()
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        proc = subprocess.Popen(  # nosec B603
-            command,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            text=False,
-            start_new_session=True,
-            env=env,
-        )
-        with _ACTIVE_PROCS_LOCK:
-            _ACTIVE_PROCS.add(proc)
+    proc = subprocess.Popen(  # nosec B603
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        start_new_session=True,
+        env=env,
+        umask=0o077,
+    )
+    with _ACTIVE_PROCS_LOCK:
+        _ACTIVE_PROCS.add(proc)
+    if proc.stdout is None or proc.stderr is None:
+        _terminate_process_group(proc)
+        raise ScannerError("Failed to establish guarded subprocess output pipes")
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    stdout_total = [0]
+    stderr_total = [0]
+    stdout_thread = threading.Thread(
+        target=_drain_stream,
+        args=(proc.stdout, max_stdout_bytes, stdout_chunks, stdout_total),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_stream,
+        args=(proc.stderr, max_stderr_bytes, stderr_chunks, stderr_total),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    try:
         try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
             try:
-                proc.wait(timeout=timeout_s)
-            except subprocess.TimeoutExpired as exc:
-                try:
-                    os.killpg(proc.pid, 15)
-                    proc.wait(timeout=2)
-                except OSError:
-                    try:
-                        os.killpg(proc.pid, 9)
-                    except OSError:
-                        _ = False
-                raise ScannerTimeoutError(
-                    f"External tool timed out after {timeout_s}s: {binary}"
-                ) from exc
-
-            stdout_file.seek(0)
-            stderr_file.seek(0)
-            stdout = stdout_file.read(max_stdout_bytes).decode("utf-8", errors="replace")
-            stderr = stderr_file.read(max_stderr_bytes).decode("utf-8", errors="replace")
-            stdout_file.seek(0, os.SEEK_END)
-            stderr_file.seek(0, os.SEEK_END)
-            stdout_size = stdout_file.tell()
-            stderr_size = stderr_file.tell()
-            elapsed = int((time.monotonic() - started) * 1000)
-            return {
-                "tool": binary,
-                "command": _redact_command(command),
-                "exit_code": proc.returncode,
-                "duration_ms": elapsed,
-                "stdout": stdout,
-                "stderr": stderr,
-                "output_truncated": (
-                    stdout_size > max_stdout_bytes
-                    or stderr_size > max_stderr_bytes
-                ),
-            }
-        finally:
-            with _ACTIVE_PROCS_LOCK:
-                _ACTIVE_PROCS.discard(proc)
+                _terminate_process_group(proc)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            stdout_thread.join(timeout=2.0)
+            stderr_thread.join(timeout=2.0)
+            raise ScannerTimeoutError(
+                f"External tool timed out after {timeout_s}s: {requested_binary}"
+            ) from exc
+        stdout_thread.join()
+        stderr_thread.join()
+        stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        elapsed = int((time.monotonic() - started) * 1000)
+        return {
+            "status": "ok" if proc.returncode == 0 else "error",
+            "tool": requested_binary,
+            "command": _redact_command(command),
+            "exit_code": proc.returncode,
+            "duration_ms": elapsed,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_bytes": stdout_total[0],
+            "stderr_bytes": stderr_total[0],
+            "output_truncated": (
+                stdout_total[0] > max_stdout_bytes
+                or stderr_total[0] > max_stderr_bytes
+            ),
+        }
+    finally:
+        proc.stdout.close()
+        proc.stderr.close()
+        with _ACTIVE_PROCS_LOCK:
+            _ACTIVE_PROCS.discard(proc)
 
 
 def run_external_binary(
@@ -181,6 +258,7 @@ def run_external_binary(
     timeout_s: float = 120.0,
     max_stdout_bytes: int = 20000,
     max_stderr_bytes: int = 8000,
+    route: bool = True,
 ) -> dict:
     """Run an installed binary with guarded runtime and output limits."""
     command = [binary]
@@ -191,6 +269,7 @@ def run_external_binary(
         timeout_s=timeout_s,
         max_stdout_bytes=max_stdout_bytes,
         max_stderr_bytes=max_stderr_bytes,
+        route=route,
     )
 
 
@@ -200,14 +279,24 @@ def verify_audit_log_integrity(log_path: str) -> dict:
 
 
 def sqlmap_scan(url: str, args: list[str] | None = None, timeout_s: float = 300.0) -> dict:
-    output_dir = os.path.join(tempfile.gettempdir(), "sqlmap_out")
-    command = ["sqlmap", "-u", url, "--batch", "--random-agent", "--output-dir", output_dir, "--dump-format", "json"]
-    if args:
-        command.extend(args)
-    result = _run_external_tool(command, timeout_s=timeout_s)
-    if result.get("exit_code") == 0:
-        result["parsed"] = parse_sqlmap_json(result.get("stdout", ""))
-    return result
+    with tempfile.TemporaryDirectory(prefix="ghostmcp-sqlmap-") as output_dir:
+        command = [
+            "sqlmap",
+            "-u",
+            url,
+            "--batch",
+            "--random-agent",
+            "--output-dir",
+            output_dir,
+            "--dump-format",
+            "json",
+        ]
+        if args:
+            command.extend(args)
+        result = _run_external_tool(command, timeout_s=timeout_s)
+        if result.get("exit_code") == 0:
+            result["parsed"] = parse_sqlmap_json(result.get("stdout", ""))
+        return result
 
 
 def hydra_scan(target: str, service: str, user: str, wordlist: str, timeout_s: float = 300.0) -> dict:
@@ -721,7 +810,7 @@ def rpcclient_query(host: str, command: str = "enumdomusers", timeout_s: float =
 
 def searchsploit_query(query: str, timeout_s: float = 60.0) -> dict:
     command = ["searchsploit", "--json", query]
-    return _run_external_tool(command, timeout_s=timeout_s)
+    return _run_external_tool(command, timeout_s=timeout_s, route=False)
 
 
 def nuclei_scan(target: str, templates: str | None = None, timeout_s: float = 600.0) -> dict:
@@ -736,12 +825,12 @@ def nuclei_scan(target: str, templates: str | None = None, timeout_s: float = 60
 
 def exiftool_scan(file_path: str, timeout_s: float = 60.0) -> dict:
     command = ["exiftool", "-json", file_path]
-    return _run_external_tool(command, timeout_s=timeout_s)
+    return _run_external_tool(command, timeout_s=timeout_s, route=False)
 
 
 def binwalk_scan(file_path: str, timeout_s: float = 300.0) -> dict:
     command = ["binwalk", file_path]
-    return _run_external_tool(command, timeout_s=timeout_s)
+    return _run_external_tool(command, timeout_s=timeout_s, route=False)
 
 
 def ffuf_scan(url: str, wordlist: str = "/usr/share/wordlists/dirb/common.txt", timeout_s: float = 300.0) -> dict:
@@ -826,7 +915,7 @@ def s3scanner_scan(bucket: str, timeout_s: float = 120.0) -> dict:
 
 def trufflehog_scan(path: str, timeout_s: float = 600.0) -> dict:
     command = ["trufflehog", "filesystem", path, "--json"]
-    result = _run_external_tool(command, timeout_s=timeout_s)
+    result = _run_external_tool(command, timeout_s=timeout_s, route=False)
     if result.get("exit_code") == 0:
         result["parsed"] = parse_trufflehog_json(result.get("stdout", ""))
     return result
@@ -834,7 +923,7 @@ def trufflehog_scan(path: str, timeout_s: float = 600.0) -> dict:
 
 def gitleaks_scan(path: str, timeout_s: float = 600.0) -> dict:
     command = ["gitleaks", "detect", "--source", path, "--report-format", "json"]
-    result = _run_external_tool(command, timeout_s=timeout_s)
+    result = _run_external_tool(command, timeout_s=timeout_s, route=False)
     if result.get("exit_code") == 0:
         result["parsed"] = parse_gitleaks_json(result.get("stdout", ""))
     return result

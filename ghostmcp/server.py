@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import ipaddress
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import ssl
 import sys
 import threading
 import time
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
@@ -78,6 +80,13 @@ from .scanners import (
     wpscan_scan,
 )
 from .security import SecurityPolicy
+from .tool_policy import (
+    TOOL_MANIFEST,
+    descriptor_for_curated,
+    descriptor_for_raw,
+    enforce_capabilities,
+    validate_effective_arguments,
+)
 from .transport_security import TransportAuthMiddleware, get_transport_principal
 from .workflows import (
     host_exposure_assessment,
@@ -111,7 +120,19 @@ def _env_csv(name: str) -> set[str]:
 
 
 cfg = load_config()
-policy = SecurityPolicy(cfg)
+_base_policy = SecurityPolicy(cfg)
+_current_policy: ContextVar[SecurityPolicy] = ContextVar(
+    "ghostmcp_current_policy",
+    default=_base_policy,
+)
+
+
+class _PolicyProxy:
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_current_policy.get(), name)
+
+
+policy = _PolicyProxy()
 rate_limiter = SlidingWindowRateLimiter(
     max_calls=int(_env("RATE_LIMIT_CALLS", "120")),
     window_seconds=int(_env("RATE_LIMIT_WINDOW_SECONDS", "60")),
@@ -129,7 +150,7 @@ mcp = FastMCP(
 ToolLevel = Literal["passive", "active", "intrusive"]
 EngagementMode = Literal["default", "passive", "active", "intrusive"]
 TOOL_LEVELS = {"passive": 1, "active": 2, "intrusive": 3}
-CORE_TOOL_COUNT = 20
+CORE_TOOL_COUNT = 21
 _metrics_lock = threading.Lock()
 _shutdown_event = threading.Event()
 AUDIT_SINK_PATH = _env("AUDIT_SINK_PATH", "").strip()
@@ -149,8 +170,12 @@ AUTH_TOKEN = _env("AUTH_TOKEN", "").strip()
 MTLS_CA_CERT = _env("MTLS_CA_CERT_PATH", "").strip()
 MTLS_CERT = _env("MTLS_CERT_PATH", "").strip()
 MTLS_KEY = _env("MTLS_KEY_PATH", "").strip()
+TLS_CERT = _env("TLS_CERT_PATH", "").strip()
+TLS_KEY = _env("TLS_KEY_PATH", "").strip()
 HTTP_HOST = _env("HTTP_HOST", "127.0.0.1").strip()
 HTTP_PORT = int(_env("HTTP_PORT", "8000"))
+if HTTP_PORT < 1 or HTTP_PORT > 65535:
+    raise RuntimeError("GHOSTMCP_HTTP_PORT must be between 1 and 65535")
 ALLOW_INSECURE_REMOTE_NO_AUTH = _env("ALLOW_INSECURE_REMOTE_NO_AUTH", "false").strip().lower() in {
     "1",
     "true",
@@ -337,6 +362,14 @@ ENABLED_RAW_MCP_TOOLS = sorted(
 ENABLED_BINARY_MCP_TOOLS = sorted(
     {*ENABLED_CURATED_MCP_TOOLS, *ENABLED_RAW_MCP_TOOLS}
 )
+for _raw_tool_name, _raw_binary in DYNAMIC_KALI_RAW_TOOL_BINARIES.items():
+    TOOL_MANIFEST.register(
+        descriptor_for_raw(
+            _raw_tool_name,
+            _raw_binary,
+            available=_raw_tool_name in ENABLED_RAW_MCP_TOOLS,
+        )
+    )
 
 
 def _validate_runtime_security() -> None:
@@ -357,6 +390,9 @@ def _validate_runtime_security() -> None:
         raise RuntimeError(
             "Plugins were enabled without GHOSTMCP_PLUGIN_ALLOWLIST"
         )
+    from .proxy import validate_proxy_configuration
+
+    validate_proxy_configuration(required=cfg.require_routed_execution)
 
 
 def _validate_transport_auth_configuration() -> None:
@@ -375,6 +411,23 @@ def _validate_transport_auth_configuration() -> None:
         )
     if AUTH_MODE == "token" and not AUTH_TOKEN:
         raise RuntimeError("token auth mode requires GHOSTMCP_AUTH_TOKEN")
+    try:
+        http_is_loopback = ipaddress.ip_address(HTTP_HOST).is_loopback
+    except ValueError:
+        http_is_loopback = HTTP_HOST.lower() == "localhost"
+    if (
+        TRANSPORT_MODE == "remote_gateway"
+        and AUTH_MODE == "token"
+        and not http_is_loopback
+    ):
+        if not TLS_CERT or not TLS_KEY:
+            raise RuntimeError(
+                "Non-loopback token transport requires "
+                "GHOSTMCP_TLS_CERT_PATH and GHOSTMCP_TLS_KEY_PATH"
+            )
+        for required in (TLS_CERT, TLS_KEY):
+            if not Path(required).exists():
+                raise RuntimeError(f"TLS file not found: {required}")
     if AUTH_MODE == "mtls":
         for required in (MTLS_CA_CERT, MTLS_CERT, MTLS_KEY):
             if not required:
@@ -439,12 +492,62 @@ def _instrument_tool(tool_name: str, tool_level: ToolLevel):
     def decorator(fn):
         fn_signature = inspect.signature(fn)
         resolved_hints = get_type_hints(fn, globalns=fn.__globals__, include_extras=True)
+        try:
+            descriptor = TOOL_MANIFEST.get(tool_name)
+        except ValueError:
+            descriptor = TOOL_MANIFEST.register(
+                descriptor_for_curated(
+                    tool_name,
+                    tool_level,
+                    available=(
+                        tool_name not in SUPPORTED_EXTERNAL_TOOL_BINARIES
+                        or tool_name in ENABLED_CURATED_MCP_TOOLS
+                    ),
+                )
+            )
 
         @wraps(fn)
         def wrapped(*args, **kwargs):
             _record_call_start(tool_name)
             started = time.monotonic()
+            policy_token = None
             try:
+                bound = fn_signature.bind(*args, **kwargs)
+                bound.apply_defaults()
+                engagement_id = bound.arguments.get("engagement_id")
+                base_policy = (
+                    _base_policy
+                    if _base_policy.config is cfg
+                    else SecurityPolicy(cfg, credentials=_base_policy.credentials)
+                )
+                scoped_policy = base_policy.for_engagement(
+                    str(engagement_id) if engagement_id else None
+                )
+                policy_token = _current_policy.set(scoped_policy)
+                enforce_capabilities(
+                    descriptor,
+                    scoped_policy.config.allowed_capabilities,
+                )
+                if (
+                    descriptor.raw
+                    and "raw_execution"
+                    not in scoped_policy.config.allowed_capabilities
+                ):
+                    raise PermissionError(
+                        "Raw tools require the raw_execution capability"
+                    )
+                if (
+                    scoped_policy.config.require_routed_execution
+                    and descriptor.route_support == "direct_only"
+                ):
+                    raise PermissionError(
+                        f"Tool cannot satisfy routed-execution policy: {tool_name}"
+                    )
+                validate_effective_arguments(
+                    descriptor,
+                    dict(bound.arguments),
+                    policy,
+                )
                 with TOOL_CLASS_LIMITS[tool_level]:
                     result = fn(*args, **kwargs)
             except ScannerTimeoutError:
@@ -455,6 +558,9 @@ def _instrument_tool(tool_name: str, tool_level: ToolLevel):
                 duration_ms = int((time.monotonic() - started) * 1000)
                 _record_call_result(tool_name, success=False, duration_ms=duration_ms)
                 raise
+            finally:
+                if policy_token is not None:
+                    _current_policy.reset(policy_token)
             duration_ms = int((time.monotonic() - started) * 1000)
             _record_call_result(tool_name, success=True, duration_ms=duration_ms)
             return result
@@ -472,7 +578,11 @@ def _instrument_tool(tool_name: str, tool_level: ToolLevel):
             return_annotation=resolved_return,
         )
         wrapped.__annotations__ = {
-            **{k: v for k, v in resolved_hints.items() if k != "return"},
+            **{
+                k: v
+                for k, v in resolved_hints.items()
+                if k not in {"auth_token", "return"}
+            },
             "return": resolved_return,
         }
         return wrapped
@@ -497,6 +607,42 @@ RAW_TOOL_ARG_ALLOW_PREFIX = {
     "s3scanner": ["--bucket", "--json", "--threads"],
     "trufflehog": ["filesystem", "--json", "--include-paths", "--exclude-paths"],
     "gitleaks": ["detect", "--source", "--report-format", "--config", "--verbose"],
+    "sqlmap": [
+        "--level",
+        "--risk",
+        "--technique",
+        "--threads",
+        "--timeout",
+        "--retries",
+        "--batch",
+        "--random-agent",
+    ],
+    "wpscan": [
+        "--enumerate",
+        "--plugins-detection",
+        "--themes-detection",
+        "--random-user-agent",
+        "--request-timeout",
+        "--connect-timeout",
+    ],
+    "dirsearch": [
+        "--threads",
+        "--timeout",
+        "--retries",
+        "--exclude-status",
+        "--include-status",
+        "--random-agent",
+        "--recursive",
+    ],
+    "crackmapexec": [
+        "--shares",
+        "--sessions",
+        "--users",
+        "--groups",
+        "--pass-pol",
+        "--loggedon-users",
+    ],
+    "smbmap": ["-u", "-p", "-d", "--no-banner"],
 }
 MAX_RAW_ARG_COUNT = int(_env("MAX_RAW_ARG_COUNT", "24"))
 MAX_RAW_ARG_LENGTH = int(_env("MAX_RAW_ARG_LENGTH", "256"))
@@ -637,7 +783,8 @@ def _authorize(
     normalized_tool_level = _normalize_tool_level(tool_level)
     normalized_engagement_mode = _normalize_tool_level(engagement_mode)
 
-    if cfg.require_engagement_context and not engagement_id:
+    active_policy = _current_policy.get()
+    if active_policy.config.require_engagement_context and not engagement_id:
         _record_call_denied(tool_name)
         raise ValueError("engagement_id is required by policy")
 
@@ -651,7 +798,7 @@ def _authorize(
             tool_name,
         )
 
-    configured_max = cfg.max_tool_level
+    configured_max = active_policy.config.max_tool_level
     if configured_max not in TOOL_LEVELS:
         configured_max = "intrusive"
     if TOOL_LEVELS[normalized_tool_level] > TOOL_LEVELS[configured_max]:
@@ -664,12 +811,24 @@ def _authorize(
         raise ValueError(
             f"Tool level '{normalized_tool_level}' exceeds engagement mode '{normalized_engagement_mode}'"
         )
+    if (
+        normalized_tool_level == "intrusive"
+        and active_policy.scope_digest is None
+        and not active_policy.config.allow_unscoped_intrusive
+    ):
+        _record_call_denied(tool_name)
+        raise PermissionError(
+            "Intrusive tools require a policy-backed engagement scope"
+        )
 
     return {
         "engagement_id": engagement_id or "unspecified",
         "engagement_mode": normalized_engagement_mode,
         "tool_level": normalized_tool_level,
         "principal_id": principal.principal_id if principal else "stdio:local",
+        "scope_digest": active_policy.scope_digest,
+        "approval_id": active_policy.approval_id,
+        "approved_by": active_policy.approved_by,
     }
 
 
@@ -686,6 +845,9 @@ def _audit_tool_call(
             "engagement_mode": context["engagement_mode"],
             "tool_level": context["tool_level"],
             "principal_id": context["principal_id"],
+            "scope_digest": context["scope_digest"],
+            "approval_id": context["approval_id"],
+            "approved_by": context["approved_by"],
             "target": target,
         }
     )
@@ -1116,6 +1278,25 @@ def toolchain_status_tool(
 
 
 @mcp.tool()
+@_instrument_tool("tool_manifest_tool", "passive")
+def tool_manifest_tool(
+    engagement_id: str | None = None,
+    engagement_mode: EngagementMode = "passive",
+    auth_token: str | None = None,
+) -> dict:
+    """Return versioned security metadata for every GhostMCP tool."""
+    context = _authorize(
+        "tool_manifest_tool",
+        "passive",
+        engagement_id,
+        engagement_mode,
+        auth_token,
+    )
+    _audit_tool_call("tool_manifest_tool", context)
+    return TOOL_MANIFEST.export(__version__)
+
+
+@mcp.tool()
 @_instrument_tool("metrics_tool", "passive")
 def metrics_tool(
     engagement_id: str | None = None,
@@ -1164,7 +1345,8 @@ def sqlmap_tool(
     """Run automated SQL injection tests using sqlmap."""
     context = _authorize("sqlmap_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     _enforce_url_scope(url)
-    injected_args = policy.inject_credentials("sqlmap", url, args or [])
+    safe_args = _validate_raw_tool_args("sqlmap", args)
+    injected_args = policy.inject_credentials("sqlmap", url, safe_args)
     _audit_tool_call("sqlmap_tool", context, target=url)
     return sqlmap_scan(url, args=injected_args)
 
@@ -1203,19 +1385,20 @@ def enum4linux_ng_tool(
 
 
 @_optional_binary_tool("crackmapexec_tool")
-@_instrument_tool("crackmapexec_tool", "active")
+@_instrument_tool("crackmapexec_tool", "intrusive")
 def crackmapexec_tool(
     service: str,
     target: str,
     args: list[str] | None = None,
     engagement_id: str | None = None,
-    engagement_mode: EngagementMode = "active",
+    engagement_mode: EngagementMode = "intrusive",
     auth_token: str | None = None,
 ) -> dict:
     """Run network service assessment using crackmapexec."""
-    context = _authorize("crackmapexec_tool", "active", engagement_id, engagement_mode, auth_token)
+    context = _authorize("crackmapexec_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     policy.validate_target(target)
-    injected_args = policy.inject_credentials("crackmapexec", target, args or [])
+    safe_args = _validate_raw_tool_args("crackmapexec", args)
+    injected_args = policy.inject_credentials("crackmapexec", target, safe_args)
     _audit_tool_call("crackmapexec_tool", context, target=target)
     return crackmapexec_scan(service, target, args=injected_args)
 
@@ -1237,17 +1420,17 @@ def theharvester_tool(
 
 
 @_optional_binary_tool("masscan_tool")
-@_instrument_tool("masscan_tool", "active")
+@_instrument_tool("masscan_tool", "intrusive")
 def masscan_tool(
     targets: str,
     ports: str,
     rate: int = 1000,
     engagement_id: str | None = None,
-    engagement_mode: EngagementMode = "active",
+    engagement_mode: EngagementMode = "intrusive",
     auth_token: str | None = None,
 ) -> dict:
     """Run high-speed port scanning with masscan."""
-    context = _authorize("masscan_tool", "active", engagement_id, engagement_mode, auth_token)
+    context = _authorize("masscan_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     validated_targets = policy.validate_masscan_targets(targets)
     _audit_tool_call("masscan_tool", context, target=validated_targets)
     return masscan_scan(validated_targets, ports, rate=rate)
@@ -1282,7 +1465,7 @@ def wpscan_tool(
     context = _authorize("wpscan_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     _enforce_url_scope(url)
     _audit_tool_call("wpscan_tool", context, target=url)
-    return wpscan_scan(url, args=args)
+    return wpscan_scan(url, args=_validate_raw_tool_args("wpscan", args))
 
 
 @_optional_binary_tool("dirsearch_tool")
@@ -1298,7 +1481,7 @@ def dirsearch_tool(
     context = _authorize("dirsearch_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     _enforce_url_scope(url)
     _audit_tool_call("dirsearch_tool", context, target=url)
-    return dirsearch_scan(url, args=args)
+    return dirsearch_scan(url, args=_validate_raw_tool_args("dirsearch", args))
 
 
 @_optional_binary_tool("sslyze_tool")
@@ -1317,47 +1500,47 @@ def sslyze_tool(
 
 
 @_optional_binary_tool("smbmap_tool")
-@_instrument_tool("smbmap_tool", "active")
+@_instrument_tool("smbmap_tool", "intrusive")
 def smbmap_tool(
     host: str,
     args: list[str] | None = None,
     engagement_id: str | None = None,
-    engagement_mode: EngagementMode = "active",
+    engagement_mode: EngagementMode = "intrusive",
     auth_token: str | None = None,
 ) -> dict:
     """Run SMB share enumeration with smbmap."""
-    context = _authorize("smbmap_tool", "active", engagement_id, engagement_mode, auth_token)
+    context = _authorize("smbmap_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     policy.validate_target(host)
     _audit_tool_call("smbmap_tool", context, target=host)
-    return smbmap_scan(host, args=args)
+    return smbmap_scan(host, args=_validate_raw_tool_args("smbmap", args))
 
 
 @_optional_binary_tool("smbclient_tool")
-@_instrument_tool("smbclient_tool", "active")
+@_instrument_tool("smbclient_tool", "intrusive")
 def smbclient_tool(
     host: str,
     engagement_id: str | None = None,
-    engagement_mode: EngagementMode = "active",
+    engagement_mode: EngagementMode = "intrusive",
     auth_token: str | None = None,
 ) -> dict:
     """List SMB shares with smbclient."""
-    context = _authorize("smbclient_tool", "active", engagement_id, engagement_mode, auth_token)
+    context = _authorize("smbclient_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     policy.validate_target(host)
     _audit_tool_call("smbclient_tool", context, target=host)
     return smbclient_list(host)
 
 
 @_optional_binary_tool("rpcclient_tool")
-@_instrument_tool("rpcclient_tool", "active")
+@_instrument_tool("rpcclient_tool", "intrusive")
 def rpcclient_tool(
     host: str,
     command: str = "enumdomusers",
     engagement_id: str | None = None,
-    engagement_mode: EngagementMode = "active",
+    engagement_mode: EngagementMode = "intrusive",
     auth_token: str | None = None,
 ) -> dict:
     """Query MSRPC endpoints with rpcclient."""
-    context = _authorize("rpcclient_tool", "active", engagement_id, engagement_mode, auth_token)
+    context = _authorize("rpcclient_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     policy.validate_target(host)
     _audit_tool_call("rpcclient_tool", context, target=host)
     return rpcclient_query(host, command=command)
@@ -1617,7 +1800,7 @@ def web_surface_assessment_tool(
         auth_token,
     )
     _audit_tool_call("web_surface_assessment_tool", context, target=url)
-    return web_surface_assessment(policy, url, cfg.user_agent)
+    return web_surface_assessment(_current_policy.get(), url, cfg.user_agent)
 
 
 @mcp.tool()
@@ -1640,7 +1823,7 @@ def tls_posture_assessment_tool(
     _audit_tool_call(
         "tls_posture_assessment_tool", context, target=f"{host}:{port}"
     )
-    return tls_posture_assessment(policy, host, port)
+    return tls_posture_assessment(_current_policy.get(), host, port)
 
 
 @mcp.tool()
@@ -1662,7 +1845,7 @@ def host_exposure_assessment_tool(
     )
     _audit_tool_call("host_exposure_assessment_tool", context, target=host)
     return host_exposure_assessment(
-        policy, host, ports, cfg.connect_timeout_ms
+        _current_policy.get(), host, ports, cfg.connect_timeout_ms
     )
 
 
@@ -1760,6 +1943,22 @@ def main() -> None:
     if "--version" in sys.argv:
         print(f"GhostMCP v{__version__}")
         sys.exit(0)
+    if "--healthcheck" in sys.argv:
+        _validate_runtime_security()
+        _validate_transport_auth_configuration()
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "version": __version__,
+                    "manifest_schema": TOOL_MANIFEST.export(__version__)[
+                        "schema_version"
+                    ],
+                },
+                sort_keys=True,
+            )
+        )
+        sys.exit(0)
 
     _validate_runtime_security()
     _validate_transport_auth_configuration()
@@ -1825,6 +2024,13 @@ def main() -> None:
                         "ssl_certfile": MTLS_CERT,
                         "ssl_ca_certs": MTLS_CA_CERT,
                         "ssl_cert_reqs": ssl.CERT_REQUIRED,
+                    }
+                )
+            elif AUTH_MODE == "token" and TLS_CERT and TLS_KEY:
+                uvicorn_kwargs.update(
+                    {
+                        "ssl_keyfile": TLS_KEY,
+                        "ssl_certfile": TLS_CERT,
                     }
                 )
             config = uvicorn.Config(app, **uvicorn_kwargs)

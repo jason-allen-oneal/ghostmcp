@@ -2,6 +2,8 @@ import os
 import sys
 import types
 import unittest
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("GHOSTMCP_REQUIRE_ENGAGEMENT_CONTEXT", "false")
@@ -46,6 +48,7 @@ from ghostmcp.server import (
     wafw00f_tool,
     whatweb_tool,
 )
+from ghostmcp.server import cfg as server_cfg
 
 
 class NewServerToolsTests(unittest.TestCase):
@@ -127,7 +130,8 @@ class NewServerToolsTests(unittest.TestCase):
 
     @patch("ghostmcp.server.rate_limiter.allow", return_value=True)
     def test_engagement_id_required_when_enabled(self, _allow) -> None:
-        cfg_stub = types.SimpleNamespace(
+        cfg_stub = replace(
+            server_cfg,
             require_engagement_context=True,
             max_tool_level="intrusive",
         )
@@ -155,8 +159,11 @@ class NewServerToolsTests(unittest.TestCase):
         }
         with patch(
             "ghostmcp.server.cfg",
-            types.SimpleNamespace(
-                require_engagement_context=False, max_tool_level="intrusive"
+            replace(
+                server_cfg,
+                require_engagement_context=False,
+                max_tool_level="intrusive",
+                allow_unscoped_intrusive=True,
             ),
         ):
             result = nmap_service_scan_tool("internal.example", top_ports=100)
@@ -195,8 +202,11 @@ class NewServerToolsTests(unittest.TestCase):
         }
         with patch(
             "ghostmcp.server.cfg",
-            types.SimpleNamespace(
-                require_engagement_context=False, max_tool_level="intrusive"
+            replace(
+                server_cfg,
+                require_engagement_context=False,
+                max_tool_level="intrusive",
+                allow_unscoped_intrusive=True,
             ),
         ):
             result = nikto_tool("https://app.example.com")
@@ -238,8 +248,12 @@ class NewServerToolsTests(unittest.TestCase):
         }
         with patch(
             "ghostmcp.server.cfg",
-            types.SimpleNamespace(
-                require_engagement_context=False, max_tool_level="intrusive"
+            replace(
+                server_cfg,
+                require_engagement_context=False,
+                max_tool_level="intrusive",
+                allowed_paths=(Path("/usr/share/dirb/wordlists"),),
+                allow_unscoped_intrusive=True,
             ),
         ):
             result = gobuster_dir_tool("https://app.example.com")

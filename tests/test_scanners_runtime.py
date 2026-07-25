@@ -23,6 +23,24 @@ class ScannerRuntimeTests(unittest.TestCase):
             ],
         )
 
+    def test_smbmap_password_is_redacted(self) -> None:
+        from ghostmcp.scanners import _redact_command
+
+        self.assertEqual(
+            _redact_command(
+                ["smbmap", "-H", "10.0.0.2", "-u", "u", "-p", "secret"]
+            ),
+            [
+                "smbmap",
+                "-H",
+                "10.0.0.2",
+                "-u",
+                "u",
+                "-p",
+                "<redacted>",
+            ],
+        )
+
     def test_missing_binary(self) -> None:
         with self.assertRaises(ScannerError):
             run_external_binary("__ghostmcp_missing_binary__")

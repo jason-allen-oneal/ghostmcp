@@ -1,6 +1,6 @@
 # GhostMCP documentation
 
-GhostMCP is an alpha security automation server for authorized assessment workflows. These documents describe the hardened runtime introduced in version `0.2.0a1`.
+GhostMCP is a beta security automation server for authorized assessment workflows. These documents describe the hardened runtime in version `0.2.0`.
 
 ## Start here
 

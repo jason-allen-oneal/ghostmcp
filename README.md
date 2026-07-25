@@ -12,7 +12,7 @@
 
 GhostMCP is a security-focused MCP server for authorized assessment workflows. It combines policy-guarded native tools, curated external scanners, normalized workflows, a local dashboard, scheduling, credential backends, and auditable execution.
 
-GhostMCP is currently an alpha release. It defaults to a restricted posture and should be deployed only in environments where the operator controls the target scope, credentials, network path, and installed security tools.
+GhostMCP is currently a beta release. It defaults to a restricted posture and should be deployed only in environments where the operator controls the target scope, credentials, network path, and installed security tools.
 
 ## Safety and authorization
 
@@ -36,6 +36,8 @@ Secure defaults include:
 - Curated wrappers for common security tools when their binaries are installed
 - Optional raw Kali wrappers with explicit global enablement and per-binary allowlisting
 - CIDR, domain, port, engagement, and tool-level policy controls
+- Versioned tool capability/target manifest and policy-backed approval provenance
+- Fail-closed routed execution and bounded in-memory subprocess output
 - Streamable HTTP transport with bearer-token or mTLS authentication
 - SQLite engagement, scan, schedule, and finding persistence
 - Authenticated web dashboard with a guarded execution registry
@@ -120,7 +122,7 @@ Clients authenticate at the HTTP transport with:
 Authorization: Bearer <token>
 ```
 
-The token is not exposed as an MCP tool argument. For network-accessible deployments, prefer mTLS, bind to an internal interface, and restrict the port with a firewall or private overlay network.
+The token is not exposed as an MCP tool argument. Non-loopback token binding requires `GHOSTMCP_TLS_CERT_PATH` and `GHOSTMCP_TLS_KEY_PATH`; otherwise startup fails. For network-accessible deployments, prefer mTLS, bind to an internal interface, and restrict the port with a firewall or private overlay network.
 
 See [Deployment](docs/DEPLOYMENT.md) and [Security operations](docs/SECURITY-OPERATIONS.md).
 
@@ -160,7 +162,18 @@ export GHOSTMCP_ENABLE_RAW_TOOLS=true
 export GHOSTMCP_RAW_TOOL_ALLOWLIST=nmap,testssl.sh
 ```
 
-Raw wrappers remain subject to engagement context, tool-level ceilings, argument limits, runtime limits, output limits, and audit logging. They should be enabled sparingly.
+Raw wrappers remain subject to engagement context, capability and target validation, tool-level ceilings, argument limits, runtime limits, output limits, and audit logging. They should be enabled sparingly.
+
+## Policy-backed intrusive execution
+
+Intrusive and sensitive capabilities fail closed unless the engagement is present in a mode-`0600` policy file with an expiration, narrow target scope, capability list, and approval provenance:
+
+```bash
+export GHOSTMCP_ENGAGEMENT_POLICY_FILE=/etc/ghostmcp/engagement-policy.json
+export GHOSTMCP_MAX_TOOL_LEVEL=intrusive
+```
+
+Start from [`engagement-policy.example.json`](engagement-policy.example.json). The runtime hashes the effective scope and records the scope digest, approval ID, and approver in audit events. The tool-provided `engagement_mode` can only narrow policy; it cannot grant authority.
 
 ## Plugins
 
@@ -210,6 +223,8 @@ Copy `.env.example` and review every value before deployment. Important defaults
 | `GHOSTMCP_ALLOW_PRIVATE_ONLY` | `true` | Reject public target addresses |
 | `GHOSTMCP_REQUIRE_ENGAGEMENT_CONTEXT` | `true` | Require an engagement ID for guarded calls |
 | `GHOSTMCP_MAX_TOOL_LEVEL` | `active` | Global execution ceiling |
+| `GHOSTMCP_ENGAGEMENT_POLICY_FILE` | empty | Protected policy input for scoped intrusive/sensitive authorization |
+| `GHOSTMCP_ALLOW_UNSCOPED_INTRUSIVE` | `false` | Unsafe compatibility override |
 | `GHOSTMCP_ENABLE_RAW_TOOLS` | `false` | Disable generated raw wrappers |
 | `GHOSTMCP_ENABLE_PLUGINS` | `false` | Disable external plugins |
 | `GHOSTMCP_CREDENTIAL_BACKEND` | `disabled` | Do not load or store credentials |
@@ -234,7 +249,7 @@ CI validates Python 3.11 and 3.12, dependency locks, linting, typing, Bandit, de
 
 ## Release status
 
-The package version is `0.2.0a1`. Treat the current interface and operational model as alpha-quality. Review release notes and configuration changes before upgrading.
+The package version is `0.2.0`. The runtime is beta-quality: policy enforcement is fail-closed, but operators must still layer network egress controls, least privilege, protected secrets, and written authorization around it.
 
 ## License
 

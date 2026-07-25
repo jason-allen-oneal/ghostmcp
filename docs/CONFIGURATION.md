@@ -24,6 +24,7 @@ Boolean settings accept `true`, `false`, `1`, `0`, `yes`, `no`, `on`, and `off`.
 | `GHOSTMCP_MAX_PORTS_PER_SCAN` | `256` | Maximum unique ports in a guarded scan |
 | `GHOSTMCP_CONNECT_TIMEOUT_MS` | `1500` | Per-connection timeout |
 | `GHOSTMCP_MAX_CONCURRENT_CONNECTS` | `64` | Maximum concurrent connection attempts |
+| `GHOSTMCP_MAX_TARGET_ADDRESSES` | `4096` | Maximum combined addresses in a network/range target expression |
 | `GHOSTMCP_USER_AGENT` | `GhostMCP/0.2` | User agent for internal HTTP requests |
 
 All resolved addresses must pass policy. A hostname that resolves to a mix of permitted and prohibited addresses is rejected. Literal IP URLs and masscan CIDRs or ranges are validated through the same policy model.
@@ -43,11 +44,44 @@ export GHOSTMCP_BLOCKED_PORTS=22,2375,2376,3389
 | --- | --- | --- |
 | `GHOSTMCP_REQUIRE_ENGAGEMENT_CONTEXT` | `true` | Require `engagement_id` on guarded tool calls |
 | `GHOSTMCP_MAX_TOOL_LEVEL` | `active` | Global ceiling: `passive`, `active`, or `intrusive` |
+| `GHOSTMCP_ALLOWED_CAPABILITIES` | all known capabilities | Comma-separated capability ceiling |
+| `GHOSTMCP_ENGAGEMENT_POLICY_FILE` | empty | Mode-`0600` JSON policy file used to authorize and narrow engagements |
+| `GHOSTMCP_ALLOW_UNSCOPED_INTRUSIVE` | `false` | Unsafe compatibility override for intrusive calls without policy provenance |
 | `GHOSTMCP_MAX_PASSIVE_PARALLEL` | implementation default | Parallel limit for passive tools |
 | `GHOSTMCP_MAX_ACTIVE_PARALLEL` | implementation default | Parallel limit for active tools |
 | `GHOSTMCP_MAX_INTRUSIVE_PARALLEL` | implementation default | Parallel limit for intrusive tools |
 
-A tool call must pass both the global ceiling and the engagement-specific ceiling. Keep the global ceiling at `active` unless an authorized engagement explicitly requires intrusive behavior.
+A tool call must pass the global ceiling, capability ceiling, effective-target checks, and engagement-specific ceiling. Keep the global ceiling at `active` unless an authorized engagement explicitly requires intrusive behavior.
+
+An intrusive or sensitive policy entry requires:
+
+- an unexpired `expires_at`
+- `max_tool_level` and `allowed_capabilities`
+- at least one explicit CIDR, domain, filesystem path, or resource
+- `authorization.approval_id`, `approved_by`, `approved_at`, and `reason`
+
+The policy file must be owned by the GhostMCP service user and have mode `0600`. Start from [`engagement-policy.example.json`](../engagement-policy.example.json). Empty engagement capability lists deny every tool; they do not mean unlimited access.
+
+## Filesystem and resource scope
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `GHOSTMCP_ALLOWED_PATHS` | empty | Platform-path-separated roots permitted for file-backed tools |
+| `GHOSTMCP_FORBIDDEN_PATHS` | empty | Platform-path-separated deny roots applied after allowlisting |
+| `GHOSTMCP_ALLOWED_RESOURCES` | empty | Comma-separated non-filesystem resources such as approved bucket names |
+
+`GHOSTMCP_ALLOWED_FILE_ROOTS` remains a compatibility alias for `GHOSTMCP_ALLOWED_PATHS`. If neither is set, filesystem-backed tools fail closed.
+
+## Routed execution
+
+| Setting | Default | Description |
+| --- | --- | --- |
+| `GHOSTMCP_REQUIRE_ROUTED_EXECUTION` | `false` | Deny tools that cannot honor the selected routing policy |
+| `GHOSTMCP_PROXY_MODE` | `none` | `none`, `tor`, `proxychains`, or `torsocks` |
+| `GHOSTMCP_TOR_HOST` | `127.0.0.1` | Tor SOCKS host used for proxy-aware HTTP clients |
+| `GHOSTMCP_TOR_PORT` | `9050` | Tor SOCKS port |
+
+Requested routing never silently falls back to direct execution. Startup fails if required wrappers are missing, and direct-only tools are denied when routed execution is mandatory.
 
 ## Raw wrappers
 
@@ -94,8 +128,10 @@ Plugin packages execute inside the GhostMCP process. Treat them as trusted code 
 | `GHOSTMCP_MTLS_CA_CERT_PATH` | empty | Trusted client CA path |
 | `GHOSTMCP_MTLS_CERT_PATH` | empty | Server certificate path |
 | `GHOSTMCP_MTLS_KEY_PATH` | empty | Server private-key path |
+| `GHOSTMCP_TLS_CERT_PATH` | empty | TLS certificate for non-loopback bearer-token transport |
+| `GHOSTMCP_TLS_KEY_PATH` | empty | TLS private key for non-loopback bearer-token transport |
 
-Token-mode clients send `Authorization: Bearer <token>`. Authentication is enforced at the HTTP transport before MCP dispatch.
+Token-mode clients send `Authorization: Bearer <token>`. Authentication is enforced at the HTTP transport before MCP dispatch. A non-loopback token listener requires a TLS certificate and key.
 
 Do not set `GHOSTMCP_ALLOW_INSECURE_REMOTE_NO_AUTH=true` outside isolated development. Prefer mTLS for network-accessible deployments.
 
@@ -108,13 +144,14 @@ Do not set `GHOSTMCP_ALLOW_INSECURE_REMOTE_NO_AUTH=true` outside isolated develo
 | `GHOSTMCP_DASHBOARD_TOKEN` | empty | Required dashboard bearer or login token |
 | `GHOSTMCP_DASHBOARD_SECURE_COOKIE` | `false` | Marks the dashboard cookie Secure; enable behind HTTPS |
 | `GHOSTMCP_DASHBOARD_ALLOW_UNAUTHENTICATED` | `false` | Explicit unsafe testing override |
+| `GHOSTMCP_DASHBOARD_TRUSTED_TLS_PROXY` | `false` | Required acknowledgement before binding the dashboard beyond loopback |
 | `GHOSTMCP_SCHEDULER_POLL_SECONDS` | `30` | Scheduler polling interval |
-| `GHOSTMCP_ALLOWED_FILE_ROOTS` | empty | Platform-path-separated roots available to file-backed tools |
+| `GHOSTMCP_ALLOWED_FILE_ROOTS` | empty | Compatibility alias for `GHOSTMCP_ALLOWED_PATHS` |
 
 Example Linux file-root policy:
 
 ```bash
-export GHOSTMCP_ALLOWED_FILE_ROOTS=/srv/assessments:/var/lib/ghostmcp/uploads
+export GHOSTMCP_ALLOWED_PATHS=/srv/assessments:/var/lib/ghostmcp/uploads
 ```
 
 The dashboard queue is in process. SQLite stores scan and schedule state, but an item already placed in memory is not restored after a process crash.

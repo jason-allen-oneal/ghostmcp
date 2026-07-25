@@ -11,6 +11,7 @@ WorkingDirectory=/opt/ghostmcp
 Environment=GHOSTMCP_DB_PATH=/var/lib/ghostmcp/ghostmcp.db
 Environment=GHOSTMCP_AUDIT_SINK_PATH=/var/log/ghostmcp/audit.jsonl
 EnvironmentFile=/etc/ghostmcp/ghostmcp.env
+ExecStartPre=/opt/ghostmcp/.venv/bin/ghostmcp --healthcheck
 ExecStart=/opt/ghostmcp/.venv/bin/ghostmcp
 Restart=on-failure
 RestartSec=3

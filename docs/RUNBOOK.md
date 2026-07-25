@@ -1,6 +1,6 @@
 # Operations runbook
 
-This runbook covers routine operation, health checks, incident response, backup, and upgrade procedures for the GhostMCP alpha runtime.
+This runbook covers routine operation, health checks, incident response, backup, and upgrade procedures for the GhostMCP beta runtime.
 
 ## Service health
 
@@ -122,7 +122,7 @@ For a failed scan:
 4. Verify required binaries are installed and allowlisted.
 5. Confirm credential injection did not require a disabled or unavailable backend.
 6. Check process timeout and output limits.
-7. Verify filesystem paths are inside `GHOSTMCP_ALLOWED_FILE_ROOTS`.
+7. Verify filesystem paths are inside `GHOSTMCP_ALLOWED_PATHS`.
 8. Retry only after identifying whether the failure was environmental, policy-related, or tool-related.
 
 Do not loosen global policy just to make one failed scan run. Create a narrowly scoped engagement or adjust the specific allowlist after review.
@@ -193,7 +193,7 @@ Do not delete evidence during containment.
 9. Start the dashboard only after the gateway is healthy.
 10. Monitor logs and metrics closely after the upgrade.
 
-The current release is alpha. Do not assume configuration or database behavior remains unchanged between alpha versions.
+The current release is beta. Do not assume configuration or database behavior remains unchanged between minor versions.
 
 ## Rollback
 

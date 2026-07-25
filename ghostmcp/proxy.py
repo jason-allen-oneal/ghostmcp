@@ -7,12 +7,16 @@ from typing import Literal
 ProxyMode = Literal["none", "tor", "proxychains", "torsocks"]
 
 
+class ProxyConfigurationError(RuntimeError):
+    """Configured routing cannot be enforced safely."""
+
+
 def get_proxy_mode() -> ProxyMode:
     """Get the configured proxy mode from environment."""
     mode = os.getenv("GHOSTMCP_PROXY_MODE", "none").strip().lower()
     valid_modes: tuple[ProxyMode, ...] = ("none", "tor", "proxychains", "torsocks")
     if mode not in valid_modes:
-        return "none"
+        raise ProxyConfigurationError(f"Unsupported proxy mode: {mode}")
     return mode
 
 
@@ -32,15 +36,16 @@ def build_proxychains_command(command: list[str]) -> list[str]:
         return ["proxychains4", "-q"] + command
     if shutil.which("proxychains"):
         return ["proxychains", "-q"] + command
-    # Fall back to running without proxy if proxychains not available
-    return command
+    raise ProxyConfigurationError(
+        "proxychains mode requested but proxychains is not installed"
+    )
 
 
 def build_torsocks_command(command: list[str]) -> list[str]:
     """Wrap a command with torsocks."""
     if shutil.which("torsocks"):
         return ["torsocks"] + command
-    return command
+    raise ProxyConfigurationError("torsocks mode requested but torsocks is not installed")
 
 
 def apply_proxy_mode(command: list[str]) -> list[str]:
@@ -48,9 +53,9 @@ def apply_proxy_mode(command: list[str]) -> list[str]:
     mode = get_proxy_mode()
 
     if mode == "tor":
-        # For tor mode, we use environment variables for tools that support it
-        # The actual proxy env vars will be set in _run_external_tool
-        return command
+        if shutil.which("torsocks"):
+            return build_torsocks_command(command)
+        return build_proxychains_command(command)
     elif mode == "proxychains":
         return build_proxychains_command(command)
     elif mode == "torsocks":
@@ -74,3 +79,21 @@ def get_proxy_env() -> dict[str, str] | None:
                 "all_proxy": proxy["http"],
             }
     return None
+
+
+def validate_proxy_configuration(*, required: bool = False) -> None:
+    mode = get_proxy_mode()
+    if required and mode == "none":
+        raise ProxyConfigurationError(
+            "Routed execution is required but GHOSTMCP_PROXY_MODE is none"
+        )
+    if mode == "proxychains":
+        build_proxychains_command(["true"])
+    elif mode == "torsocks":
+        build_torsocks_command(["true"])
+    elif mode == "tor" and not (
+        shutil.which("torsocks")
+        or shutil.which("proxychains4")
+        or shutil.which("proxychains")
+    ):
+        raise ProxyConfigurationError("Tor mode requires torsocks or proxychains")
