@@ -29,6 +29,23 @@ import ghostmcp.server as server
 
 
 class ServerRegistrationTests(unittest.TestCase):
+    def test_every_binary_tool_has_manifest_metadata(self) -> None:
+        manifest_names = {
+            item["name"]
+            for item in server.TOOL_MANIFEST.export(server_version="test")["tools"]
+        }
+        self.assertTrue(
+            set(server.BINARY_MCP_TOOL_BINARIES).issubset(manifest_names)
+        )
+
+    def test_raw_tools_are_not_enabled_by_default(self) -> None:
+        if not server.cfg.allow_raw_tools:
+            self.assertTrue(
+                set(server.ENABLED_BINARY_MCP_TOOLS).isdisjoint(
+                    server.DYNAMIC_KALI_RAW_TOOL_BINARIES
+                )
+            )
+
     def test_enabled_binary_tools_subset_of_registered(self) -> None:
         for name in server.ENABLED_BINARY_MCP_TOOLS:
             self.assertIn(name, server.BINARY_MCP_TOOL_BINARIES)

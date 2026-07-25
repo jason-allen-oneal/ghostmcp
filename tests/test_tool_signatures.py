@@ -33,6 +33,7 @@ class ToolSignatureTests(unittest.TestCase):
     def test_dns_lookup_signature_not_args_kwargs(self) -> None:
         sig = inspect.signature(server.dns_lookup_tool)
         self.assertIn("domain", sig.parameters)
+        self.assertNotIn("auth_token", sig.parameters)
         self.assertNotIn("args", sig.parameters)
         self.assertNotIn("kwargs", sig.parameters)
 

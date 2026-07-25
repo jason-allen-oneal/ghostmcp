@@ -15,7 +15,7 @@ class WorkflowConfigTests(unittest.TestCase):
         text = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("ruff check .", text)
         self.assertIn("mypy ghostmcp", text)
-        self.assertIn("python -m unittest discover -s tests", text)
+        self.assertIn("python -m pytest", text)
 
     def test_release_workflow_has_provenance_and_sbom(self) -> None:
         root = Path(__file__).resolve().parents[1]

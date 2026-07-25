@@ -1,0 +1,65 @@
+name: Release artifact
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock.txt
+          python -m pip install --require-hashes -r requirements-release.lock.txt
+          python -m pip install -e . --no-deps
+
+      - name: Verify release
+        run: |
+          ruff check .
+          mypy ghostmcp
+          bandit -q -r ghostmcp
+          python -m pytest
+          python -m compileall -q ghostmcp
+          python -m pip check
+
+      - name: Build and verify distribution
+        run: |
+          python -m build
+          python -m twine check dist/*
+          python scripts/verify_distribution.py dist
+
+      - name: Write release metadata and checksums
+        run: |
+          sha256sum dist/* > dist/SHA256SUMS
+          printf '{"project":"ghostmcp-server","version":"%s","commit":"%s","ref":"%s"}\n' \
+            "${GITHUB_REF_NAME}" "${GITHUB_SHA}" "${GITHUB_REF}" > dist/release-metadata.json
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghostmcp-${{ github.ref_name }}-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

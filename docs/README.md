@@ -5,6 +5,7 @@ This folder contains operator-facing documentation for GhostMCP.
 ## Quick links
 
 - Getting started: see the repo README.
+- Execution security and authorization: see `SECURITY_MODEL.md`.
 - Security reporting: see SECURITY.md.
 - Container deployment: see `deploy/container/`.
 

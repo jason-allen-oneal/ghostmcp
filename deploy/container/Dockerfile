@@ -18,6 +18,23 @@ RUN python -m pip install --no-cache-dir --require-hashes -r /app/requirements.l
 # Copy app source (run from source, do not pip-install the project).
 COPY ghostmcp /app/ghostmcp
 
-EXPOSE 8766
+RUN groupadd --system --gid 10001 ghostmcp \
+  && useradd --system --uid 10001 --gid ghostmcp --home-dir /nonexistent \
+       --shell /usr/sbin/nologin ghostmcp \
+  && install -d -o ghostmcp -g ghostmcp -m 0700 /data /audit
+
+ENV GHOSTMCP_CREDENTIAL_STORE=/data/credentials.bin \
+  GHOSTMCP_DB_PATH=/data/ghostmcp.db \
+  GHOSTMCP_AUDIT_SINK_PATH=/audit/audit.jsonl \
+  GHOSTMCP_ALLOW_RAW_TOOLS=false \
+  GHOSTMCP_ALLOW_UNSCOPED_INTRUSIVE=false
+
+VOLUME ["/data", "/audit"]
+EXPOSE 8000
+
+USER 10001:10001
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD ["python", "-m", "ghostmcp", "--healthcheck"]
 
 ENTRYPOINT ["python", "-m", "ghostmcp"]

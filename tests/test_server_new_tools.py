@@ -26,7 +26,8 @@ if "mcp.server.fastmcp" not in sys.modules:
     sys.modules["mcp.server"] = mcp_server_module
     sys.modules["mcp.server.fastmcp"] = fastmcp_module
 
-from ghostmcp.security import ValidationResult
+from ghostmcp.config import ServerConfig
+from ghostmcp.security import SecurityPolicy, ValidationResult
 from ghostmcp.server import (
     amass_passive_tool,
     common_web_paths_tool,
@@ -46,6 +47,32 @@ from ghostmcp.server import (
 
 
 class NewServerToolsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        base_policy_patcher = patch(
+            "ghostmcp.server._base_policy",
+            SecurityPolicy(
+                ServerConfig(allow_unscoped_intrusive=True),
+                credentials=object(),
+            ),
+        )
+        target_patcher = patch(
+            "ghostmcp.security.SecurityPolicy.validate_target",
+            side_effect=lambda host: ValidationResult(
+                host=str(host),
+                ips=["10.0.0.1"],
+            ),
+        )
+        domain_patcher = patch(
+            "ghostmcp.security.SecurityPolicy.validate_domain",
+            side_effect=lambda domain, **_kwargs: str(domain).strip().lower(),
+        )
+        base_policy_patcher.start()
+        target_patcher.start()
+        domain_patcher.start()
+        self.addCleanup(base_policy_patcher.stop)
+        self.addCleanup(target_patcher.stop)
+        self.addCleanup(domain_patcher.stop)
+
     @patch("ghostmcp.server.rate_limiter.allow", return_value=True)
     @patch("ghostmcp.server.fetch_security_txt")
     @patch("ghostmcp.server.policy.validate_domain", return_value="example.com")
@@ -116,18 +143,18 @@ class NewServerToolsTests(unittest.TestCase):
         self.assertIn("admin.example.com", result["candidates"])
 
     @patch("ghostmcp.server.rate_limiter.allow", return_value=True)
-    def test_common_web_paths_tool(self, _allow) -> None:
+    @patch("ghostmcp.security.SecurityPolicy.validate_url", return_value="https://app.example.com")
+    def test_common_web_paths_tool(self, _validate_url, _allow) -> None:
         result = common_web_paths_tool("https://app.example.com", profile="light")
         self.assertEqual(result["profile"], "light")
         self.assertIn("https://app.example.com/robots.txt", result["urls"])
 
     @patch("ghostmcp.server.rate_limiter.allow", return_value=True)
     def test_engagement_id_required_when_enabled(self, _allow) -> None:
-        cfg_stub = types.SimpleNamespace(
-            require_engagement_context=True,
-            max_tool_level="intrusive",
+        scoped_policy = SecurityPolicy(
+            ServerConfig(require_engagement_context=True)
         )
-        with patch("ghostmcp.server.cfg", cfg_stub):
+        with patch("ghostmcp.server._base_policy", scoped_policy):
             with self.assertRaises(ValueError):
                 ioc_extract_tool("abc")
 
@@ -155,7 +182,8 @@ class NewServerToolsTests(unittest.TestCase):
 
     @patch("ghostmcp.server.rate_limiter.allow", return_value=True)
     @patch("ghostmcp.server.whatweb_scan")
-    def test_whatweb_tool(self, mock_whatweb, _allow) -> None:
+    @patch("ghostmcp.security.SecurityPolicy.validate_url", return_value="https://app.example.com")
+    def test_whatweb_tool(self, _validate_url, mock_whatweb, _allow) -> None:
         mock_whatweb.return_value = {
             "tool": "whatweb",
             "command": ["whatweb", "--color=never", "https://app.example.com"],
@@ -171,7 +199,8 @@ class NewServerToolsTests(unittest.TestCase):
 
     @patch("ghostmcp.server.rate_limiter.allow", return_value=True)
     @patch("ghostmcp.server.nikto_scan")
-    def test_nikto_tool(self, mock_nikto, _allow) -> None:
+    @patch("ghostmcp.security.SecurityPolicy.validate_url", return_value="https://app.example.com")
+    def test_nikto_tool(self, _validate_url, mock_nikto, _allow) -> None:
         mock_nikto.return_value = {
             "tool": "nikto",
             "command": ["nikto", "-host", "https://app.example.com", "-Format", "txt"],
@@ -206,7 +235,8 @@ class NewServerToolsTests(unittest.TestCase):
 
     @patch("ghostmcp.server.rate_limiter.allow", return_value=True)
     @patch("ghostmcp.server.gobuster_dir_scan")
-    def test_gobuster_dir_tool(self, mock_gobuster, _allow) -> None:
+    @patch("ghostmcp.security.SecurityPolicy.validate_url", return_value="https://app.example.com")
+    def test_gobuster_dir_tool(self, _validate_url, mock_gobuster, _allow) -> None:
         mock_gobuster.return_value = {
             "tool": "gobuster",
             "command": ["gobuster", "dir"],
@@ -244,7 +274,8 @@ class NewServerToolsTests(unittest.TestCase):
 
     @patch("ghostmcp.server.rate_limiter.allow", return_value=True)
     @patch("ghostmcp.server.wafw00f_scan")
-    def test_wafw00f_tool(self, mock_wafw00f, _allow) -> None:
+    @patch("ghostmcp.security.SecurityPolicy.validate_url", return_value="https://app.example.com")
+    def test_wafw00f_tool(self, _validate_url, mock_wafw00f, _allow) -> None:
         mock_wafw00f.return_value = {
             "tool": "wafw00f",
             "command": ["wafw00f", "https://app.example.com"],

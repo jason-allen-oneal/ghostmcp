@@ -16,8 +16,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from typing import BinaryIO
 
 from .parsers.amass import parse_amass_json
 from .parsers.assetfinder import parse_assetfinder_output
@@ -37,6 +39,7 @@ from .parsers.subfinder import parse_subfinder_json
 from .parsers.trufflehog import parse_trufflehog_json
 from .parsers.wpscan import parse_wpscan_json
 from .proxy import apply_proxy_mode, get_proxy_env
+from .redaction import redact_text
 
 
 @dataclass
@@ -56,6 +59,14 @@ class ScannerTimeoutError(ScannerError):
 
 _ACTIVE_PROCS: set[subprocess.Popen] = set()
 _ACTIVE_PROCS_LOCK = threading.Lock()
+_SENSITIVE_FLAGS = {
+    "-p",
+    "--password",
+    "--pass",
+    "--auth-cred",
+    "--api-key",
+    "--token",
+}
 
 
 def terminate_active_processes() -> int:
@@ -74,77 +85,183 @@ def terminate_active_processes() -> int:
     return terminated
 
 
+def _minimal_subprocess_env(proxy_env: dict[str, str] | None) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key in ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "HOME"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    if proxy_env:
+        env.update(proxy_env)
+    return env
+
+
+def _redact_command(command: list[str]) -> list[str]:
+    redacted: list[str] = []
+    hide_next = False
+    for arg in command:
+        if hide_next:
+            redacted.append("[REDACTED]")
+            hide_next = False
+            continue
+        lowered = arg.lower()
+        if lowered in _SENSITIVE_FLAGS:
+            redacted.append(arg)
+            hide_next = True
+            continue
+        if any(lowered.startswith(f"{flag}=") for flag in _SENSITIVE_FLAGS):
+            redacted.append(f"{arg.split('=', 1)[0]}=[REDACTED]")
+            continue
+        if "://" in arg:
+            parsed = urllib.parse.urlsplit(arg)
+            if parsed.username or parsed.password:
+                host = parsed.hostname or ""
+                if parsed.port:
+                    host = f"{host}:{parsed.port}"
+                arg = urllib.parse.urlunsplit(
+                    (parsed.scheme, host, parsed.path, parsed.query, parsed.fragment)
+                )
+        redacted.append(redact_text(arg))
+    return redacted
+
+
+def _drain_stream(
+    stream: BinaryIO,
+    limit: int,
+    chunks: list[bytes],
+    total: list[int],
+) -> None:
+    retained = 0
+    while True:
+        data = stream.read(8192)
+        if not data:
+            return
+        total[0] += len(data)
+        if retained < limit:
+            chunk = data[: limit - retained]
+            chunks.append(chunk)
+            retained += len(chunk)
+
+
+def _terminate_process_group(proc: subprocess.Popen, grace_s: float = 2.0) -> None:
+    try:
+        os.killpg(proc.pid, 15)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=grace_s)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, 9)
+    except ProcessLookupError:
+        return
+    proc.wait(timeout=grace_s)
+
+
 def _run_external_tool(
     command: list[str],
     timeout_s: float = 120.0,
     max_stdout_bytes: int = 20000,
     max_stderr_bytes: int = 8000,
+    route: bool = True,
 ) -> dict:
-    # Apply proxy mode to command
-    command = apply_proxy_mode(command)
-    binary = command[0]
-    path = shutil.which(binary)
-    if not path:
-        raise ScannerError(f"Required tool is not installed: {binary}")
+    if not command:
+        raise ScannerError("External tool command is empty")
+    requested_binary = command[0]
+    if not shutil.which(requested_binary):
+        raise ScannerError(f"Required tool is not installed: {requested_binary}")
+    if route:
+        command = apply_proxy_mode(command)
+    launcher = command[0]
+    if not shutil.which(launcher):
+        raise ScannerError(f"Required execution wrapper is not installed: {launcher}")
 
     # Get proxy environment
-    proxy_env = get_proxy_env()
-    env = os.environ.copy()
-    if proxy_env:
-        env.update(proxy_env)
+    proxy_env = get_proxy_env() if route else None
+    env = _minimal_subprocess_env(proxy_env)
 
     started = time.monotonic()
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        proc = subprocess.Popen(  # nosec B603
-            command,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            text=False,
-            start_new_session=True,
-            env=env,
-        )
-        with _ACTIVE_PROCS_LOCK:
-            _ACTIVE_PROCS.add(proc)
+    proc = subprocess.Popen(  # nosec B603
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        start_new_session=True,
+        env=env,
+        umask=0o077,
+    )
+    with _ACTIVE_PROCS_LOCK:
+        _ACTIVE_PROCS.add(proc)
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    stdout_total = [0]
+    stderr_total = [0]
+    if proc.stdout is None or proc.stderr is None:
+        _terminate_process_group(proc)
+        raise ScannerError("Failed to establish guarded subprocess output pipes")
+    stdout_thread = threading.Thread(
+        target=_drain_stream,
+        args=(proc.stdout, max_stdout_bytes, stdout_chunks, stdout_total),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_stream,
+        args=(proc.stderr, max_stderr_bytes, stderr_chunks, stderr_total),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    try:
         try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired as exc:
             try:
-                proc.wait(timeout=timeout_s)
-            except subprocess.TimeoutExpired as exc:
-                try:
-                    os.killpg(proc.pid, 15)
-                    proc.wait(timeout=2)
-                except OSError:
-                    try:
-                        os.killpg(proc.pid, 9)
-                    except OSError:
-                        _ = False
-                raise ScannerTimeoutError(
-                    f"External tool timed out after {timeout_s}s: {binary}"
-                ) from exc
-
-            stdout_file.seek(0)
-            stderr_file.seek(0)
-            stdout = stdout_file.read(max_stdout_bytes).decode("utf-8", errors="replace")
-            stderr = stderr_file.read(max_stderr_bytes).decode("utf-8", errors="replace")
-            stdout_file.seek(0, os.SEEK_END)
-            stderr_file.seek(0, os.SEEK_END)
-            stdout_size = stdout_file.tell()
-            stderr_size = stderr_file.tell()
-            elapsed = int((time.monotonic() - started) * 1000)
-            return {
-                "tool": binary,
-                "command": command,
-                "exit_code": proc.returncode,
-                "duration_ms": elapsed,
-                "stdout": stdout,
-                "stderr": stderr,
-                "output_truncated": (
-                    stdout_size > max_stdout_bytes
-                    or stderr_size > max_stderr_bytes
-                ),
-            }
-        finally:
-            with _ACTIVE_PROCS_LOCK:
-                _ACTIVE_PROCS.discard(proc)
+                _terminate_process_group(proc)
+            except (OSError, subprocess.TimeoutExpired):
+                # The caller still receives a timeout; the active-process
+                # registry lets shutdown handling make another termination
+                # attempt if the OS refuses the first one.
+                pass
+            raise ScannerTimeoutError(
+                f"External tool timed out after {timeout_s}s: {requested_binary}"
+            ) from exc
+        stdout_thread.join()
+        stderr_thread.join()
+        stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        if os.getenv("GHOSTMCP_REDACT_OUTPUT", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            stdout = redact_text(stdout)
+            stderr = redact_text(stderr)
+        elapsed = int((time.monotonic() - started) * 1000)
+        return {
+            "status": "ok" if proc.returncode == 0 else "error",
+            "tool": requested_binary,
+            "command": _redact_command(command),
+            "exit_code": proc.returncode,
+            "duration_ms": elapsed,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_bytes": stdout_total[0],
+            "stderr_bytes": stderr_total[0],
+            "output_truncated": (
+                stdout_total[0] > max_stdout_bytes
+                or stderr_total[0] > max_stderr_bytes
+            ),
+        }
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
+        with _ACTIVE_PROCS_LOCK:
+            _ACTIVE_PROCS.discard(proc)
 
 
 def run_external_binary(
@@ -153,6 +270,7 @@ def run_external_binary(
     timeout_s: float = 120.0,
     max_stdout_bytes: int = 20000,
     max_stderr_bytes: int = 8000,
+    route: bool = True,
 ) -> dict:
     """Run an installed binary with guarded runtime and output limits."""
     command = [binary]
@@ -163,6 +281,7 @@ def run_external_binary(
         timeout_s=timeout_s,
         max_stdout_bytes=max_stdout_bytes,
         max_stderr_bytes=max_stderr_bytes,
+        route=route,
     )
 
 
@@ -187,7 +306,11 @@ def verify_audit_log_integrity(log_path: str) -> dict:
 
                 # Calculate current hash (excluding the hash fields themselves)
                 base_event = {k: v for k, v in event.items() if k not in ("event_hash", "signature")}
-                event_str = json.dumps(base_event, sort_keys=True)
+                event_str = json.dumps(
+                    base_event,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
                 calculated_hash = hashlib.sha256(event_str.encode()).hexdigest()
 
                 if event.get("event_hash") != calculated_hash:
@@ -246,6 +369,35 @@ def _with_retry(fn, retries: int = 1, backoff_s: float = 0.5):
     raise last_exc  # type: ignore[misc]
 
 
+class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, validator: Callable[[str], object]) -> None:
+        super().__init__()
+        self._validator = validator
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self._validator(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _url_opener(
+    validator: Callable[[str], object] | None = None,
+) -> urllib.request.OpenerDirector:
+    handlers: list[urllib.request.BaseHandler] = []
+    if validator is not None:
+        handlers.append(_ValidatingRedirectHandler(validator))
+    proxy_env = get_proxy_env()
+    if proxy_env:
+        handlers.append(
+            urllib.request.ProxyHandler(
+                {
+                    "http": proxy_env.get("http_proxy", ""),
+                    "https": proxy_env.get("https_proxy", ""),
+                }
+            )
+        )
+    return urllib.request.build_opener(*handlers)
+
+
 def dns_lookup(domain: str, record_type: str = "A") -> list[str]:
     rtype = record_type.upper().strip()
     if rtype != "A":
@@ -279,22 +431,19 @@ def whois_query(target: str, timeout_s: float = 4.0) -> str:
     return _with_retry(_query, retries=1, backoff_s=0.25)
 
 
-def http_probe(url: str, user_agent: str, timeout_s: float = 4.0) -> dict:
+def http_probe(
+    url: str,
+    user_agent: str,
+    timeout_s: float = 4.0,
+    url_validator: Callable[[str], object] | None = None,
+) -> dict:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError("URL scheme must be http or https")
     if not parsed.netloc:
         raise ValueError("URL host is required")
 
-    # Set up proxy handler if configured
-    proxy_env = get_proxy_env()
-    opener = urllib.request.build_opener()
-    if proxy_env:
-        proxy_handler = urllib.request.ProxyHandler({
-            "http": proxy_env.get("http_proxy", ""),
-            "https": proxy_env.get("https_proxy", ""),
-        })
-        opener = urllib.request.build_opener(proxy_handler)
+    opener = _url_opener(url_validator)
 
     req = urllib.request.Request(
         url=url,
@@ -386,18 +535,14 @@ def tls_certificate_expiry(host: str, port: int = 443, timeout_s: float = 4.0) -
     }
 
 
-def fetch_security_txt(domain: str, user_agent: str, timeout_s: float = 4.0) -> dict:
+def fetch_security_txt(
+    domain: str,
+    user_agent: str,
+    timeout_s: float = 4.0,
+    url_validator: Callable[[str], object] | None = None,
+) -> dict:
     url = f"https://{domain}/.well-known/security.txt"
-
-    # Set up proxy handler if configured
-    proxy_env = get_proxy_env()
-    opener = urllib.request.build_opener()
-    if proxy_env:
-        proxy_handler = urllib.request.ProxyHandler({
-            "http": proxy_env.get("http_proxy", ""),
-            "https": proxy_env.get("https_proxy", ""),
-        })
-        opener = urllib.request.build_opener(proxy_handler)
+    opener = _url_opener(url_validator)
 
     req = urllib.request.Request(
         url=url,
@@ -585,6 +730,7 @@ def nmap_service_scan(
     host: str,
     ports: list[int] | None = None,
     top_ports: int = 100,
+    exclude_ports: tuple[int, ...] = (),
     timeout_s: float = 120.0,
 ) -> dict:
     command = ["nmap", "-Pn", "-sV", "-oX", "-"]
@@ -592,6 +738,8 @@ def nmap_service_scan(
         command.extend(["-p", ",".join(str(p) for p in ports)])
     else:
         command.extend(["--top-ports", str(top_ports)])
+    if exclude_ports:
+        command.extend(["--exclude-ports", ",".join(str(port) for port in exclude_ports)])
     command.append(host)
     result = _run_external_tool(command, timeout_s=timeout_s)
 
@@ -726,7 +874,7 @@ def rpcclient_query(host: str, command: str = "enumdomusers", timeout_s: float =
 
 def searchsploit_query(query: str, timeout_s: float = 60.0) -> dict:
     command = ["searchsploit", "--json", query]
-    return _run_external_tool(command, timeout_s=timeout_s)
+    return _run_external_tool(command, timeout_s=timeout_s, route=False)
 
 
 def nuclei_scan(target: str, templates: str | None = None, timeout_s: float = 600.0) -> dict:
@@ -741,12 +889,12 @@ def nuclei_scan(target: str, templates: str | None = None, timeout_s: float = 60
 
 def exiftool_scan(file_path: str, timeout_s: float = 60.0) -> dict:
     command = ["exiftool", "-json", file_path]
-    return _run_external_tool(command, timeout_s=timeout_s)
+    return _run_external_tool(command, timeout_s=timeout_s, route=False)
 
 
 def binwalk_scan(file_path: str, timeout_s: float = 300.0) -> dict:
     command = ["binwalk", file_path]
-    return _run_external_tool(command, timeout_s=timeout_s)
+    return _run_external_tool(command, timeout_s=timeout_s, route=False)
 
 
 def ffuf_scan(url: str, wordlist: str = "/usr/share/wordlists/dirb/common.txt", timeout_s: float = 300.0) -> dict:
@@ -831,7 +979,7 @@ def s3scanner_scan(bucket: str, timeout_s: float = 120.0) -> dict:
 
 def trufflehog_scan(path: str, timeout_s: float = 600.0) -> dict:
     command = ["trufflehog", "filesystem", path, "--json"]
-    result = _run_external_tool(command, timeout_s=timeout_s)
+    result = _run_external_tool(command, timeout_s=timeout_s, route=False)
     if result.get("exit_code") == 0:
         result["parsed"] = parse_trufflehog_json(result.get("stdout", ""))
     return result
@@ -839,7 +987,7 @@ def trufflehog_scan(path: str, timeout_s: float = 600.0) -> dict:
 
 def gitleaks_scan(path: str, timeout_s: float = 600.0) -> dict:
     command = ["gitleaks", "detect", "--source", path, "--report-format", "json"]
-    result = _run_external_tool(command, timeout_s=timeout_s)
+    result = _run_external_tool(command, timeout_s=timeout_s, route=False)
     if result.get("exit_code") == 0:
         result["parsed"] = parse_gitleaks_json(result.get("stdout", ""))
     return result

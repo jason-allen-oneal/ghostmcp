@@ -2,6 +2,7 @@
 
 import importlib.metadata
 import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -42,6 +43,14 @@ class Plugin(ABC):
         """Validate plugin configuration."""
         return True
 
+    def declared_tools(self) -> list[str]:
+        """Declare tool names before registration."""
+        return []
+
+    def security_metadata(self) -> dict[str, dict[str, Any]]:
+        """Return risk, capability, target, and routing metadata per tool."""
+        return {}
+
 
 class PluginManager:
     """Manages GhostMCP plugins."""
@@ -77,12 +86,56 @@ class PluginManager:
         except Exception as e:
             logger.error(f"Failed to register tools for {plugin.name}: {e}")
 
-    def register_plugin_tools(self, mcp) -> dict[str, list[str]]:
+    def register_plugin_tools(
+        self,
+        mcp,
+        instrument_tool: Callable[[str, dict[str, Any], Callable], Callable]
+        | None = None,
+    ) -> dict[str, list[str]]:
         """Register all plugin tools with MCP server."""
-        results = {}
+        results: dict[str, list[str]] = {}
+        enabled = os.getenv(
+            "GHOSTMCP_ENABLE_EXPERIMENTAL_PLUGINS",
+            "false",
+        ).lower() in {"1", "true", "yes", "on"}
+        if not enabled:
+            logger.warning("Plugin tool registration is disabled by policy")
+            return {name: [] for name in self._plugins}
+        if instrument_tool is None:
+            raise RuntimeError(
+                "Plugin tools require a security instrumentation callback"
+            )
+        allowed = {
+            item.strip()
+            for item in os.getenv("GHOSTMCP_ALLOWED_PLUGINS", "").split(",")
+            if item.strip()
+        }
         for name, plugin in self._plugins.items():
+            if name not in allowed:
+                logger.error("Plugin is not in GHOSTMCP_ALLOWED_PLUGINS: %s", name)
+                results[name] = []
+                continue
             try:
-                tool_names = plugin.register_tools(mcp)
+                declared = plugin.declared_tools()
+                metadata = plugin.security_metadata()
+                if not declared or set(metadata) != set(declared):
+                    raise ValueError(
+                        "Plugin must declare every tool and its security metadata"
+                    )
+                for tool_name, descriptor in metadata.items():
+                    required = {"risk", "capabilities", "target_fields", "route_support"}
+                    if not required.issubset(descriptor):
+                        raise ValueError(
+                            f"Incomplete security metadata for plugin tool: {tool_name}"
+                        )
+                guarded_mcp = _GuardedMCPProxy(
+                    mcp,
+                    metadata,
+                    instrument_tool,
+                )
+                tool_names = plugin.register_tools(guarded_mcp)
+                if set(tool_names) != set(declared):
+                    raise ValueError("Plugin registered undeclared tool names")
                 results[name] = tool_names
                 for tool_name in tool_names:
                     self._tool_to_plugin[tool_name] = name
@@ -134,9 +187,35 @@ def load_all_plugins(entry_point_group: str = "ghostmcp.plugins") -> list[str]:
     return get_plugin_manager().load_plugins(entry_point_group)
 
 
-def register_plugin_tools(mcp) -> dict[str, list[str]]:
+def register_plugin_tools(
+    mcp,
+    instrument_tool: Callable[[str, dict[str, Any], Callable], Callable]
+    | None = None,
+) -> dict[str, list[str]]:
     """Register all plugin tools with MCP server."""
-    return get_plugin_manager().register_plugin_tools(mcp)
+    return get_plugin_manager().register_plugin_tools(mcp, instrument_tool)
+
+
+class _GuardedMCPProxy:
+    def __init__(
+        self,
+        mcp: Any,
+        metadata: dict[str, dict[str, Any]],
+        instrument_tool: Callable[[str, dict[str, Any], Callable], Callable],
+    ) -> None:
+        self._mcp = mcp
+        self._metadata = metadata
+        self._instrument_tool = instrument_tool
+
+    def tool(self):
+        def decorator(fn: Callable) -> Callable:
+            name = fn.__name__
+            if name not in self._metadata:
+                raise ValueError(f"Plugin attempted to register undeclared tool: {name}")
+            guarded = self._instrument_tool(name, self._metadata[name], fn)
+            return self._mcp.tool()(guarded)
+
+        return decorator
 
 
 # Example plugin template
@@ -158,6 +237,19 @@ class ExamplePlugin(Plugin):
             return {"plugin": "example", "target": target, "result": "ok"}
 
         return ["example_tool"]
+
+    def declared_tools(self) -> list[str]:
+        return ["example_tool"]
+
+    def security_metadata(self) -> dict[str, dict[str, Any]]:
+        return {
+            "example_tool": {
+                "risk": "passive",
+                "capabilities": ["discovery"],
+                "target_fields": [{"name": "target", "kind": "host"}],
+                "route_support": "direct_only",
+            }
+        }
 
     def register_parsers(self) -> dict[str, Callable]:
         def parse_example(text: str) -> dict:

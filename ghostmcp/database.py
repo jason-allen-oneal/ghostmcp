@@ -7,7 +7,10 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
+
+from .redaction import redact_text, redact_url, redact_value
 
 
 @dataclass
@@ -50,13 +53,31 @@ class ScanFinding:
     created_at: str
 
 
+@dataclass
+class QueryResult:
+    rows: list[sqlite3.Row]
+    rowcount: int
+
+    def fetchone(self) -> sqlite3.Row | None:
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self) -> list[sqlite3.Row]:
+        return list(self.rows)
+
+
 class Database:
     """SQLite database for GhostMCP."""
 
     def __init__(self, db_path: str = "ghostmcp.db"):
         self.db_path = db_path
         self._lock = threading.Lock()
+        if db_path != ":memory:":
+            path = Path(db_path).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.db_path = str(path)
         self._init_db()
+        if self.db_path != ":memory:":
+            os.chmod(self.db_path, 0o600)
 
     def _init_db(self):
         with self._get_conn() as conn:
@@ -111,17 +132,21 @@ class Database:
     def _get_conn(self):
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 5000")
         try:
             yield conn
         finally:
             conn.close()
 
-    def _execute(self, query: str, params: tuple = ()) -> sqlite3.Cursor:
+    def _execute(self, query: str, params: tuple = ()) -> QueryResult:
         with self._lock:
             with self._get_conn() as conn:
                 cursor = conn.execute(query, params)
+                rows = cursor.fetchall() if cursor.description else []
+                rowcount = cursor.rowcount
                 conn.commit()
-                return cursor
+                return QueryResult(rows=rows, rowcount=rowcount)
 
     # Engagement methods
     def create_engagement(
@@ -137,7 +162,7 @@ class Database:
         engagement = Engagement(
             id=engagement_id,
             name=name,
-            description=description,
+            description=redact_text(description) if description else None,
             scope_cidrs=scope_cidrs or [],
             scope_domains=scope_domains or [],
             max_tool_level=max_tool_level,
@@ -192,6 +217,8 @@ class Database:
             if key in allowed:
                 if key in ("scope_cidrs", "scope_domains"):
                     value = json.dumps(value)
+                elif key == "description" and isinstance(value, str):
+                    value = redact_text(value)
                 updates.append(f"{key} = ?")
                 params.append(value)
 
@@ -201,10 +228,8 @@ class Database:
         params.append(datetime.now(UTC).isoformat())
         params.append(engagement_id)
 
-        self._execute(
-            f"UPDATE engagements SET {', '.join(updates)}, updated_at = ? WHERE id = ?",
-            tuple(params),
-        )  # nosec B608
+        query = f"UPDATE engagements SET {', '.join(updates)}, updated_at = ? WHERE id = ?"  # nosec B608
+        self._execute(query, tuple(params))
         return self.get_engagement(engagement_id)
 
     def delete_engagement(self, engagement_id: str) -> bool:
@@ -237,8 +262,8 @@ class Database:
             id=scan_id,
             engagement_id=engagement_id,
             tool_name=tool_name,
-            target=target,
-            parameters=parameters or {},
+            target=redact_url(target),
+            parameters=redact_value(parameters or {}),
             status="pending",
             result=None,
             started_at=None,
@@ -277,7 +302,13 @@ class Database:
         status = "failed" if error else "completed"
         self._execute(
             "UPDATE scans SET status = ?, completed_at = ?, result = ?, error = ? WHERE id = ?",  # nosec B608
-            (status, now, json.dumps(result) if result else None, error, scan_id),
+            (
+                status,
+                now,
+                json.dumps(redact_value(result)) if result else None,
+                redact_text(error) if error else None,
+                scan_id,
+            ),
         )
         return self.get_scan(scan_id)
 
@@ -337,9 +368,9 @@ class Database:
             finding_type=finding_type,
             severity=severity,
             title=title,
-            description=description,
-            target=target,
-            raw_data=raw_data or {},
+            description=redact_text(description),
+            target=redact_url(target),
+            raw_data=redact_value(raw_data or {}),
             created_at=now,
         )
         self._execute(

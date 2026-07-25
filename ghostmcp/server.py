@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import inspect
+import ipaddress
 import json
 import logging
 import os
@@ -11,11 +13,13 @@ import ssl
 import sys
 import threading
 import time
+from contextvars import ContextVar
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from typing import Any, Literal, cast, get_type_hints
-from urllib.parse import urlparse
+from urllib.parse import urlsplit, urlunsplit
 
 from mcp.server.fastmcp import FastMCP
 
@@ -79,6 +83,14 @@ from .scanners import (
     wpscan_scan,
 )
 from .security import SecurityPolicy
+from .tool_policy import (
+    TOOL_MANIFEST,
+    ToolDescriptor,
+    descriptor_for_curated,
+    descriptor_for_raw,
+    enforce_capabilities,
+    validate_effective_arguments,
+)
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -88,11 +100,30 @@ def _env(name: str, default: str) -> str:
     return os.getenv(f"GHOSTMCP_{name}", default)
 
 
+def _positive_env(name: str, default: str) -> int:
+    value = int(_env(name, default))
+    if value <= 0:
+        raise ValueError(f"GHOSTMCP_{name} must be positive")
+    return value
+
+
 cfg = load_config()
-policy = SecurityPolicy(cfg)
+_base_policy = SecurityPolicy(cfg)
+_current_policy: ContextVar[SecurityPolicy] = ContextVar(
+    "ghostmcp_current_policy",
+    default=_base_policy,
+)
+
+
+class _PolicyProxy:
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_current_policy.get(), name)
+
+
+policy = _PolicyProxy()
 rate_limiter = SlidingWindowRateLimiter(
-    max_calls=int(_env("RATE_LIMIT_CALLS", "120")),
-    window_seconds=int(_env("RATE_LIMIT_WINDOW_SECONDS", "60")),
+    max_calls=_positive_env("RATE_LIMIT_CALLS", "120"),
+    window_seconds=_positive_env("RATE_LIMIT_WINDOW_SECONDS", "60"),
 )
 STARTED_AT = datetime.now(UTC)
 
@@ -109,8 +140,13 @@ EngagementMode = Literal["default", "passive", "active", "intrusive"]
 TOOL_LEVELS = {"passive": 1, "active": 2, "intrusive": 3}
 _audit_lock = threading.Lock()
 _last_audit_hash = "0" * 64
+_audit_sequence = 0
 _metrics_lock = threading.Lock()
 _shutdown_event = threading.Event()
+_transport_authenticated: ContextVar[bool] = ContextVar(
+    "ghostmcp_transport_authenticated",
+    default=False,
+)
 AUDIT_SINK_PATH = _env("AUDIT_SINK_PATH", "").strip()
 
 TRANSPORT_MODE = _env("TRANSPORT_MODE", "stdio").strip().lower()
@@ -119,13 +155,12 @@ AUTH_TOKEN = _env("AUTH_TOKEN", "").strip()
 MTLS_CA_CERT = _env("MTLS_CA_CERT_PATH", "").strip()
 MTLS_CERT = _env("MTLS_CERT_PATH", "").strip()
 MTLS_KEY = _env("MTLS_KEY_PATH", "").strip()
+TLS_CERT = _env("TLS_CERT_PATH", "").strip()
+TLS_KEY = _env("TLS_KEY_PATH", "").strip()
 HTTP_HOST = _env("HTTP_HOST", "127.0.0.1").strip()
-HTTP_PORT = int(_env("HTTP_PORT", "8000"))
-ALLOW_INSECURE_REMOTE_NO_AUTH = _env("ALLOW_INSECURE_REMOTE_NO_AUTH", "false").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-}
+HTTP_PORT = _positive_env("HTTP_PORT", "8000")
+if HTTP_PORT > 65535:
+    raise ValueError("GHOSTMCP_HTTP_PORT must be at most 65535")
 ALLOW_RUN_AS_ROOT = _env("ALLOW_RUN_AS_ROOT", "false").strip().lower() in {
     "1",
     "true",
@@ -133,9 +168,9 @@ ALLOW_RUN_AS_ROOT = _env("ALLOW_RUN_AS_ROOT", "false").strip().lower() in {
 }
 
 TOOL_CLASS_LIMITS = {
-    "passive": threading.Semaphore(int(_env("MAX_PASSIVE_PARALLEL", "64"))),
-    "active": threading.Semaphore(int(_env("MAX_ACTIVE_PARALLEL", "16"))),
-    "intrusive": threading.Semaphore(int(_env("MAX_INTRUSIVE_PARALLEL", "4"))),
+    "passive": threading.Semaphore(_positive_env("MAX_PASSIVE_PARALLEL", "64")),
+    "active": threading.Semaphore(_positive_env("MAX_ACTIVE_PARALLEL", "16")),
+    "intrusive": threading.Semaphore(_positive_env("MAX_INTRUSIVE_PARALLEL", "4")),
 }
 
 METRICS: dict[str, Any] = {
@@ -294,7 +329,22 @@ ENABLED_BINARY_MCP_TOOLS = sorted(
     tool_name
     for tool_name, binary in BINARY_MCP_TOOL_BINARIES.items()
     if KALI_TOOLCHAIN_SNAPSHOT.get(binary, {}).get("installed")
+    and (
+        tool_name not in DYNAMIC_KALI_RAW_TOOL_BINARIES
+        or cfg.allow_raw_tools
+    )
 )
+for _raw_tool_name, _raw_binary in DYNAMIC_KALI_RAW_TOOL_BINARIES.items():
+    TOOL_MANIFEST.register(
+        descriptor_for_raw(
+            _raw_tool_name,
+            _raw_binary,
+            available=bool(
+                cfg.allow_raw_tools
+                and KALI_TOOLCHAIN_SNAPSHOT.get(_raw_binary, {}).get("installed")
+            ),
+        )
+    )
 
 
 def _validate_runtime_security() -> None:
@@ -302,6 +352,9 @@ def _validate_runtime_security() -> None:
         raise RuntimeError(
             "Refusing to run as root. Set GHOSTMCP_ALLOW_RUN_AS_ROOT=true to override."
         )
+    from .proxy import validate_proxy_configuration
+
+    validate_proxy_configuration(required=cfg.require_routed_execution)
 
 
 def _validate_transport_auth_configuration() -> None:
@@ -310,16 +363,28 @@ def _validate_transport_auth_configuration() -> None:
     if AUTH_MODE not in {"none", "token", "mtls"}:
         raise RuntimeError("GHOSTMCP_AUTH_MODE must be 'none', 'token', or 'mtls'")
     if TRANSPORT_MODE == "remote_gateway" and AUTH_MODE == "none":
-        if not ALLOW_INSECURE_REMOTE_NO_AUTH:
-            raise RuntimeError(
-                "remote_gateway mode with AUTH_MODE=none is blocked. "
-                "Set GHOSTMCP_ALLOW_INSECURE_REMOTE_NO_AUTH=true to override (unsafe)."
-            )
-        logger.warning(
-            "Running remote_gateway mode without auth due to explicit unsafe override."
+        raise RuntimeError(
+            "remote_gateway mode requires token authentication with TLS or mTLS"
         )
     if AUTH_MODE == "token" and not AUTH_TOKEN:
         raise RuntimeError("token auth mode requires GHOSTMCP_AUTH_TOKEN")
+    try:
+        http_is_loopback = ipaddress.ip_address(HTTP_HOST).is_loopback
+    except ValueError:
+        http_is_loopback = HTTP_HOST.lower() == "localhost"
+    if (
+        TRANSPORT_MODE == "remote_gateway"
+        and AUTH_MODE == "token"
+        and not http_is_loopback
+    ):
+        if not TLS_CERT or not TLS_KEY:
+            raise RuntimeError(
+                "Non-loopback token transport requires "
+                "GHOSTMCP_TLS_CERT_PATH and GHOSTMCP_TLS_KEY_PATH"
+            )
+        for required in (TLS_CERT, TLS_KEY):
+            if not Path(required).exists():
+                raise RuntimeError(f"TLS file not found: {required}")
     if AUTH_MODE == "mtls":
         for required in (MTLS_CA_CERT, MTLS_CERT, MTLS_KEY):
             if not required:
@@ -380,7 +445,32 @@ def _record_call_result(
             tool_metrics["timeouts"] += 1
 
 
-def _instrument_tool(tool_name: str, tool_level: ToolLevel):
+def _instrument_tool(
+    tool_name: str,
+    tool_level: ToolLevel,
+    *,
+    descriptor: ToolDescriptor | None = None,
+):
+    tool_descriptor = descriptor or descriptor_for_curated(tool_name, tool_level)
+    if tool_name in SUPPORTED_EXTERNAL_TOOL_BINARIES:
+        binary = SUPPORTED_EXTERNAL_TOOL_BINARIES[tool_name]
+        tool_descriptor = replace(
+            tool_descriptor,
+            route_support=(
+                    "proxy_aware"
+                    if any(
+                    field.kind != "path"
+                    for field in tool_descriptor.target_fields
+                )
+                else tool_descriptor.route_support
+            ),
+            binary=binary,
+            available=bool(
+                KALI_TOOLCHAIN_SNAPSHOT.get(binary, {}).get("installed")
+            ),
+        )
+    TOOL_MANIFEST.register(tool_descriptor)
+
     def decorator(fn):
         fn_signature = inspect.signature(fn)
         resolved_hints = get_type_hints(fn, globalns=fn.__globals__, include_extras=True)
@@ -389,7 +479,71 @@ def _instrument_tool(tool_name: str, tool_level: ToolLevel):
         def wrapped(*args, **kwargs):
             _record_call_start(tool_name)
             started = time.monotonic()
+            policy_token = None
             try:
+                bound = fn_signature.bind_partial(*args, **kwargs)
+                bound.apply_defaults()
+                scoped_policy = _base_policy.for_engagement(
+                    bound.arguments.get("engagement_id")
+                )
+                policy_token = _current_policy.set(scoped_policy)
+                if (
+                    tool_descriptor.risk == "intrusive"
+                    and not scoped_policy.config.allow_unscoped_intrusive
+                    and (
+                        not bound.arguments.get("engagement_id")
+                        or scoped_policy.config.engagement_policy_file is None
+                    )
+                ):
+                    raise PermissionError(
+                        "Intrusive tools require an engagement_id backed by "
+                        "a versioned engagement policy"
+                    )
+                allowed_capabilities = scoped_policy.config.allowed_capabilities
+                if (
+                    scoped_policy.scope_digest is not None
+                    and not allowed_capabilities
+                    and tool_descriptor.capabilities
+                ):
+                    raise PermissionError(
+                        "Engagement policy grants no tool capabilities"
+                    )
+                if (
+                    tool_descriptor.raw
+                    and "raw_execution" not in allowed_capabilities
+                ):
+                    raise PermissionError(
+                        "Raw tools require GHOSTMCP_ALLOWED_CAPABILITIES "
+                        "to include raw_execution"
+                    )
+                enforce_capabilities(
+                    tool_descriptor,
+                    allowed_capabilities,
+                )
+                validate_effective_arguments(
+                    tool_descriptor,
+                    dict(bound.arguments),
+                    scoped_policy,
+                )
+                _require_explicit_scope(
+                    tool_descriptor,
+                    scoped_policy,
+                    dict(bound.arguments),
+                )
+                if scoped_policy.config.require_routed_execution and any(
+                    field.kind != "path"
+                    for field in tool_descriptor.target_fields
+                ):
+                    from .proxy import get_proxy_mode
+
+                    if tool_descriptor.route_support != "proxy_aware":
+                        raise PermissionError(
+                            f"Tool cannot guarantee routed execution: {tool_name}"
+                        )
+                    if get_proxy_mode() == "none":
+                        raise PermissionError(
+                            "Routed execution is required but no proxy mode is configured"
+                        )
                 with TOOL_CLASS_LIMITS[tool_level]:
                     result = fn(*args, **kwargs)
             except ScannerTimeoutError:
@@ -400,13 +554,34 @@ def _instrument_tool(tool_name: str, tool_level: ToolLevel):
                 duration_ms = int((time.monotonic() - started) * 1000)
                 _record_call_result(tool_name, success=False, duration_ms=duration_ms)
                 raise
+            finally:
+                if policy_token is not None:
+                    _current_policy.reset(policy_token)
             duration_ms = int((time.monotonic() - started) * 1000)
-            _record_call_result(tool_name, success=True, duration_ms=duration_ms)
+            successful = True
+            if isinstance(result, dict):
+                result.setdefault("status", "ok")
+                result.setdefault("tool", tool_name)
+                result.setdefault("sensitive_output", tool_descriptor.sensitive_output)
+                successful = (
+                    result.get("status") not in {"error", "failed", "unavailable"}
+                    and result.get("exit_code", 0) == 0
+                )
+            _record_call_result(
+                tool_name,
+                success=successful,
+                duration_ms=duration_ms,
+            )
             return result
 
         # FastMCP inspects function signatures for tool schemas; preserve original params.
         resolved_params = []
         for name, param in fn_signature.parameters.items():
+            # Authentication belongs to the transport. Keep the Python
+            # compatibility parameter temporarily, but never advertise it to
+            # models as a tool argument.
+            if name == "auth_token":
+                continue
             annotation = resolved_hints.get(name, param.annotation)
             resolved_params.append(param.replace(annotation=annotation))
         resolved_return = resolved_hints.get("return", fn_signature.return_annotation)
@@ -415,12 +590,50 @@ def _instrument_tool(tool_name: str, tool_level: ToolLevel):
             return_annotation=resolved_return,
         )
         wrapped.__annotations__ = {
-            **{k: v for k, v in resolved_hints.items() if k != "return"},
+            **{
+                k: v
+                for k, v in resolved_hints.items()
+                if k not in {"return", "auth_token"}
+            },
             "return": resolved_return,
         }
         return wrapped
 
     return decorator
+
+
+def _require_explicit_scope(
+    descriptor: ToolDescriptor,
+    scoped_policy: SecurityPolicy,
+    arguments: dict[str, Any],
+) -> None:
+    if scoped_policy.config.engagement_policy_file is None:
+        return
+    kinds = {
+        field.kind
+        for field in descriptor.target_fields
+        if arguments.get(field.name) not in (None, "", [])
+    }
+    if kinds & {"host", "network", "raw_argv", "extra_argv", "url", "url_or_host"}:
+        if not (
+            scoped_policy.config.allowed_cidrs
+            or scoped_policy.config.allowed_domains
+        ):
+            raise PermissionError(
+                f"Engagement policy does not bound network targets for {descriptor.name}"
+            )
+    if "domain" in kinds and not scoped_policy.config.allowed_domains:
+        raise PermissionError(
+            f"Engagement policy does not declare allowed domains for {descriptor.name}"
+        )
+    if "path" in kinds and not scoped_policy.config.allowed_paths:
+        raise PermissionError(
+            f"Engagement policy does not declare allowed paths for {descriptor.name}"
+        )
+    if "resource" in kinds and not scoped_policy.config.allowed_resources:
+        raise PermissionError(
+            f"Engagement policy does not declare allowed resources for {descriptor.name}"
+        )
 
 
 ARG_TOKEN_RE = r"^[A-Za-z0-9._:/=,+-]+$"  # nosec B105
@@ -440,12 +653,48 @@ RAW_TOOL_ARG_ALLOW_PREFIX = {
     "s3scanner": ["--bucket", "--json", "--threads"],
     "trufflehog": ["filesystem", "--json", "--include-paths", "--exclude-paths"],
     "gitleaks": ["detect", "--source", "--report-format", "--config", "--verbose"],
+    "sqlmap": [
+        "--level",
+        "--risk",
+        "--technique",
+        "--threads",
+        "--timeout",
+        "--retries",
+        "--batch",
+        "--random-agent",
+    ],
+    "wpscan": [
+        "--enumerate",
+        "--plugins-detection",
+        "--themes-detection",
+        "--random-user-agent",
+        "--request-timeout",
+        "--connect-timeout",
+    ],
+    "dirsearch": [
+        "--threads",
+        "--timeout",
+        "--retries",
+        "--exclude-status",
+        "--include-status",
+        "--random-agent",
+        "--recursive",
+    ],
+    "crackmapexec": [
+        "--shares",
+        "--sessions",
+        "--users",
+        "--groups",
+        "--pass-pol",
+        "--loggedon-users",
+    ],
+    "smbmap": ["-u", "-p", "-d", "--no-banner"],
 }
-MAX_RAW_ARG_COUNT = int(_env("MAX_RAW_ARG_COUNT", "24"))
-MAX_RAW_ARG_LENGTH = int(_env("MAX_RAW_ARG_LENGTH", "256"))
-MAX_RAW_RUNTIME_SECONDS = int(_env("MAX_RAW_RUNTIME_SECONDS", "180"))
-MAX_RAW_STDOUT_BYTES = int(_env("MAX_RAW_STDOUT_BYTES", "20000"))
-MAX_RAW_STDERR_BYTES = int(_env("MAX_RAW_STDERR_BYTES", "8000"))
+MAX_RAW_ARG_COUNT = _positive_env("MAX_RAW_ARG_COUNT", "24")
+MAX_RAW_ARG_LENGTH = _positive_env("MAX_RAW_ARG_LENGTH", "256")
+MAX_RAW_RUNTIME_SECONDS = _positive_env("MAX_RAW_RUNTIME_SECONDS", "180")
+MAX_RAW_STDOUT_BYTES = _positive_env("MAX_RAW_STDOUT_BYTES", "20000")
+MAX_RAW_STDERR_BYTES = _positive_env("MAX_RAW_STDERR_BYTES", "8000")
 
 
 def _validate_raw_tool_args(binary: str, args: list[str] | None) -> list[str]:
@@ -486,6 +735,12 @@ def _optional_binary_tool(tool_name: str):
 
 
 def _register_dynamic_kali_raw_tools() -> None:
+    if not cfg.allow_raw_tools:
+        logger.warning(
+            "Raw tool registration is disabled; set GHOSTMCP_ALLOW_RAW_TOOLS=true "
+            "only with explicit capability and target policy."
+        )
+        return
     for tool_name, binary in DYNAMIC_KALI_RAW_TOOL_BINARIES.items():
         if not KALI_TOOLCHAIN_SNAPSHOT.get(binary, {}).get("installed"):
             continue
@@ -513,6 +768,14 @@ def _register_dynamic_kali_raw_tools() -> None:
                     timeout_s=min(timeout_s, MAX_RAW_RUNTIME_SECONDS),
                     max_stdout_bytes=MAX_RAW_STDOUT_BYTES,
                     max_stderr_bytes=MAX_RAW_STDERR_BYTES,
+                    route=(
+                        descriptor_for_raw(
+                            name,
+                            bin_name,
+                            available=True,
+                        ).route_support
+                        == "proxy_aware"
+                    ),
                 )
                 result["generated_tool"] = name
                 return result
@@ -521,7 +784,16 @@ def _register_dynamic_kali_raw_tools() -> None:
             _tool.__doc__ = (
                 f"Run raw Kali tool '{bin_name}' with optional args."
             )
-            return _instrument_tool(name, "intrusive")(_tool)
+            descriptor = descriptor_for_raw(
+                name,
+                bin_name,
+                available=True,
+            )
+            return _instrument_tool(
+                name,
+                "intrusive",
+                descriptor=descriptor,
+            )(_tool)
 
         mcp.tool()(_factory(tool_name, binary))
 
@@ -575,15 +847,16 @@ def _authorize(
     normalized_tool_level = _normalize_tool_level(tool_level)
     normalized_engagement_mode = _normalize_tool_level(engagement_mode)
 
-    if cfg.require_engagement_context and not engagement_id:
+    active_config = policy.config
+    if active_config.require_engagement_context and not engagement_id:
         _record_call_denied(tool_name)
         raise ValueError("engagement_id is required by policy")
     if TRANSPORT_MODE == "remote_gateway":
-        if AUTH_MODE == "token" and auth_token != AUTH_TOKEN:
+        if AUTH_MODE == "token" and not _transport_authenticated.get():
             _record_call_denied(tool_name)
-            raise PermissionError("Invalid auth token")
+            raise PermissionError("Transport authentication is required")
 
-    configured_max = cfg.max_tool_level
+    configured_max = active_config.max_tool_level
     if configured_max not in TOOL_LEVELS:
         configured_max = "intrusive"
     if TOOL_LEVELS[normalized_tool_level] > TOOL_LEVELS[configured_max]:
@@ -601,6 +874,9 @@ def _authorize(
         "engagement_id": engagement_id or "unspecified",
         "engagement_mode": normalized_engagement_mode,
         "tool_level": normalized_tool_level,
+        "scope_digest": policy.scope_digest,
+        "approval_id": policy.approval_id,
+        "approved_by": policy.approved_by,
     }
 
 
@@ -609,44 +885,87 @@ def _audit_tool_call(
     context: dict,
     target: str | None = None,
 ) -> None:
-    global _last_audit_hash
+    global _audit_sequence, _last_audit_hash
     now = datetime.now(UTC).isoformat()
+    safe_target = _redact_audit_target(target)
     with _audit_lock:
+        _audit_sequence += 1
         payload = {
             "ts": now,
+            "sequence": _audit_sequence,
             "tool": tool_name,
             "engagement_id": context["engagement_id"],
             "engagement_mode": context["engagement_mode"],
             "tool_level": context["tool_level"],
-            "target": target,
+            "scope_digest": context.get("scope_digest"),
+            "approval_id": context.get("approval_id"),
+            "approved_by": context.get("approved_by"),
+            "target": safe_target,
             "prev_hash": _last_audit_hash,
         }
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         new_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         payload["event_hash"] = new_hash
         _last_audit_hash = new_hash
-    logger.info("audit %s", json.dumps(payload, separators=(",", ":")))
-    if AUDIT_SINK_PATH:
-        try:
-            with open(AUDIT_SINK_PATH, "a", encoding="utf-8") as sink:
-                sink.write(json.dumps(payload, separators=(",", ":")) + "\n")
-        except Exception:
-            logger.exception("failed to write audit sink: %s", AUDIT_SINK_PATH)
+        logger.info("audit %s", json.dumps(payload, separators=(",", ":")))
+        if AUDIT_SINK_PATH:
+            try:
+                audit_path = Path(AUDIT_SINK_PATH)
+                audit_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                fd = os.open(
+                    audit_path,
+                    os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                    0o600,
+                )
+                os.chmod(audit_path, 0o600)
+                with os.fdopen(fd, "a", encoding="utf-8") as sink:
+                    sink.write(json.dumps(payload, separators=(",", ":")) + "\n")
+                    sink.flush()
+                    os.fsync(sink.fileno())
+            except Exception:
+                logger.exception("failed to write audit sink: %s", AUDIT_SINK_PATH)
+
+
+def _redact_audit_target(target: str | None) -> str | None:
+    if target is None:
+        return None
+    value = str(target)
+    if "://" in value:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    if "@" in value:
+        return value.rsplit("@", 1)[1]
+    return value
+
+
+def _initialize_audit_chain() -> None:
+    global _audit_sequence, _last_audit_hash
+    if not AUDIT_SINK_PATH:
+        return
+    path = Path(AUDIT_SINK_PATH)
+    if not path.exists():
+        return
+    os.chmod(path, 0o600)
+    last_line = ""
+    with path.open("r", encoding="utf-8") as source:
+        for line in source:
+            if line.strip():
+                last_line = line
+    if not last_line:
+        return
+    payload = json.loads(last_line)
+    event_hash = payload.get("event_hash")
+    if not isinstance(event_hash, str) or len(event_hash) != 64:
+        raise RuntimeError("Audit sink has an invalid final hash")
+    _last_audit_hash = event_hash
+    _audit_sequence = int(payload.get("sequence", 0))
 
 
 def _enforce_url_scope(url: str) -> None:
-    parsed = urlparse(url)
-    host = parsed.hostname
-    if not host:
-        raise ValueError("URL host is required")
-    try:
-        # Host is an IP; scope is enforced by host-based tools.
-        from ipaddress import ip_address
-
-        ip_address(host)
-        return
-    except ValueError:
-        policy.enforce_domain_scope(host.lower())
+    policy.validate_url(url)
 
 
 @mcp.tool()
@@ -700,10 +1019,9 @@ def whois_tool(
     if not target.strip():
         raise ValueError("Target is required")
     if any(ch.isalpha() for ch in target):
-        try:
-            policy.validate_domain(target.strip())
-        except ValueError:
-            pass
+        policy.validate_domain(target.strip(), resolve=True)
+    else:
+        policy.validate_target(target.strip())
     _audit_tool_call("whois_tool", context, target=target.strip())
     payload = whois_query(target.strip())
     logger.info("whois target=%s bytes=%d", target, len(payload))
@@ -724,7 +1042,11 @@ def http_probe_tool(
     )
     _enforce_url_scope(url)
     _audit_tool_call("http_probe_tool", context, target=url)
-    result = http_probe(url=url, user_agent=cfg.user_agent)
+    result = http_probe(
+        url=url,
+        user_agent=cfg.user_agent,
+        url_validator=policy.validate_url,
+    )
     logger.info("http_probe url=%s status=%s", url, result.get("status"))
     return result
 
@@ -743,6 +1065,7 @@ def tls_certificate_tool(
         "tls_certificate_tool", "active", engagement_id, engagement_mode, auth_token
     )
     validated = policy.validate_target(host)
+    policy.parse_ports([port])
     _audit_tool_call("tls_certificate_tool", context, target=f"{host}:{port}")
     result = tls_certificate(host=validated.host, port=port)
     logger.info("tls_certificate host=%s port=%d", host, port)
@@ -767,6 +1090,7 @@ def tls_certificate_expiry_tool(
         auth_token,
     )
     validated = policy.validate_target(host)
+    policy.parse_ports([port])
     _audit_tool_call("tls_certificate_expiry_tool", context, target=f"{host}:{port}")
     result = tls_certificate_expiry(host=validated.host, port=port)
     logger.info(
@@ -823,7 +1147,11 @@ def security_txt_tool(
     )
     validated_domain = policy.validate_domain(domain)
     _audit_tool_call("security_txt_tool", context, target=validated_domain)
-    result = fetch_security_txt(validated_domain, user_agent=cfg.user_agent)
+    result = fetch_security_txt(
+        validated_domain,
+        user_agent=cfg.user_agent,
+        url_validator=policy.validate_url,
+    )
     logger.info("security_txt domain=%s found=%s", validated_domain, result["found"])
     return result
 
@@ -924,11 +1252,14 @@ def nmap_service_scan_tool(
     )
     validated = policy.validate_target(host)
     validated_ports = policy.parse_ports(ports) if ports else None
+    if not validated_ports and not 1 <= top_ports <= cfg.max_ports_per_scan:
+        raise ValueError("top_ports exceeds the configured scan limit")
     _audit_tool_call("nmap_service_scan_tool", context, target=validated.host)
     return nmap_service_scan(
         host=validated.host,
         ports=validated_ports,
         top_ports=top_ports,
+        exclude_ports=cfg.blocked_ports,
     )
 
 
@@ -993,6 +1324,8 @@ def gobuster_dir_tool(
     context = _authorize(
         "gobuster_dir_tool", "intrusive", engagement_id, engagement_mode, auth_token
     )
+    if not 1 <= threads <= 64:
+        raise ValueError("threads must be between 1 and 64")
     _enforce_url_scope(url)
     _audit_tool_call("gobuster_dir_tool", context, target=url)
     return gobuster_dir_scan(url=url, wordlist=wordlist, threads=threads)
@@ -1010,6 +1343,7 @@ def sslscan_tool(
     """Run sslscan against host:port."""
     context = _authorize("sslscan_tool", "active", engagement_id, engagement_mode, auth_token)
     validated = policy.validate_target(host)
+    policy.parse_ports([port])
     _audit_tool_call("sslscan_tool", context, target=f"{validated.host}:{port}")
     return sslscan_target(validated.host, port=port)
 
@@ -1089,6 +1423,7 @@ def metrics_tool(
 
 
 @mcp.tool()
+@_instrument_tool("verify_audit_log_integrity_tool", "passive")
 def verify_audit_log_integrity_tool(
     engagement_id: str | None = None,
     engagement_mode: EngagementMode = "passive",
@@ -1116,7 +1451,8 @@ def sqlmap_tool(
     """Run automated SQL injection tests using sqlmap."""
     context = _authorize("sqlmap_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     _enforce_url_scope(url)
-    injected_args = policy.inject_credentials("sqlmap", url, args or [])
+    safe_args = _validate_raw_tool_args("sqlmap", args)
+    injected_args = policy.inject_credentials("sqlmap", url, safe_args)
     _audit_tool_call("sqlmap_tool", context, target=url)
     return sqlmap_scan(url, args=injected_args)
 
@@ -1135,6 +1471,23 @@ def hydra_tool(
     """Run password brute-force tests using hydra."""
     context = _authorize("hydra_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     policy.validate_target(target)
+    if service.lower() not in {
+        "ftp",
+        "http-get",
+        "http-post-form",
+        "imap",
+        "ldap2",
+        "mssql",
+        "mysql",
+        "pop3",
+        "rdp",
+        "smb",
+        "smtp",
+        "ssh",
+        "telnet",
+        "vnc",
+    }:
+        raise ValueError("Unsupported hydra service")
     _audit_tool_call("hydra_tool", context, target=target)
     return hydra_scan(target, service, user, wordlist)
 
@@ -1155,19 +1508,28 @@ def enum4linux_ng_tool(
 
 
 @_optional_binary_tool("crackmapexec_tool")
-@_instrument_tool("crackmapexec_tool", "active")
+@_instrument_tool("crackmapexec_tool", "intrusive")
 def crackmapexec_tool(
     service: str,
     target: str,
     args: list[str] | None = None,
     engagement_id: str | None = None,
-    engagement_mode: EngagementMode = "active",
+    engagement_mode: EngagementMode = "intrusive",
     auth_token: str | None = None,
 ) -> dict:
     """Run network service assessment using crackmapexec."""
-    context = _authorize("crackmapexec_tool", "active", engagement_id, engagement_mode, auth_token)
+    context = _authorize(
+        "crackmapexec_tool",
+        "intrusive",
+        engagement_id,
+        engagement_mode,
+        auth_token,
+    )
     policy.validate_target(target)
-    injected_args = policy.inject_credentials("crackmapexec", target, args or [])
+    if service.lower() not in {"ldap", "mssql", "rdp", "smb", "ssh", "winrm"}:
+        raise ValueError("Unsupported crackmapexec service")
+    safe_args = _validate_raw_tool_args("crackmapexec", args)
+    injected_args = policy.inject_credentials("crackmapexec", target, safe_args)
     _audit_tool_call("crackmapexec_tool", context, target=target)
     return crackmapexec_scan(service, target, args=injected_args)
 
@@ -1183,26 +1545,31 @@ def theharvester_tool(
 ) -> dict:
     """Run OSINT gathering with theHarvester."""
     context = _authorize("theharvester_tool", "passive", engagement_id, engagement_mode, auth_token)
+    if not source.replace(",", "").replace("-", "").isalnum():
+        raise ValueError("Invalid theHarvester source")
     validated_domain = policy.validate_domain(domain)
     _audit_tool_call("theharvester_tool", context, target=validated_domain)
     return theharvester_scan(validated_domain, source=source)
 
 
 @_optional_binary_tool("masscan_tool")
-@_instrument_tool("masscan_tool", "active")
+@_instrument_tool("masscan_tool", "intrusive")
 def masscan_tool(
     targets: str,
     ports: str,
     rate: int = 1000,
     engagement_id: str | None = None,
-    engagement_mode: EngagementMode = "active",
+    engagement_mode: EngagementMode = "intrusive",
     auth_token: str | None = None,
 ) -> dict:
     """Run high-speed port scanning with masscan."""
-    context = _authorize("masscan_tool", "active", engagement_id, engagement_mode, auth_token)
+    context = _authorize("masscan_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     validated_targets = policy.validate_masscan_targets(targets)
+    validated_ports = policy.parse_port_spec(ports)
+    if not 1 <= rate <= 10000:
+        raise ValueError("masscan rate must be between 1 and 10000")
     _audit_tool_call("masscan_tool", context, target=validated_targets)
-    return masscan_scan(validated_targets, ports, rate=rate)
+    return masscan_scan(validated_targets, validated_ports, rate=rate)
 
 
 @_optional_binary_tool("dnsrecon_tool")
@@ -1216,6 +1583,8 @@ def dnsrecon_tool(
 ) -> dict:
     """Run DNS enumeration with dnsrecon."""
     context = _authorize("dnsrecon_tool", "active", engagement_id, engagement_mode, auth_token)
+    if scan_type not in {"std", "rvl", "brt", "srv", "axfr", "bing", "yand", "crt"}:
+        raise ValueError("Unsupported dnsrecon scan type")
     validated_domain = policy.validate_domain(domain)
     _audit_tool_call("dnsrecon_tool", context, target=validated_domain)
     return dnsrecon_scan(validated_domain, scan_type=scan_type)
@@ -1234,7 +1603,7 @@ def wpscan_tool(
     context = _authorize("wpscan_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     _enforce_url_scope(url)
     _audit_tool_call("wpscan_tool", context, target=url)
-    return wpscan_scan(url, args=args)
+    return wpscan_scan(url, args=_validate_raw_tool_args("wpscan", args))
 
 
 @_optional_binary_tool("dirsearch_tool")
@@ -1250,7 +1619,7 @@ def dirsearch_tool(
     context = _authorize("dirsearch_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     _enforce_url_scope(url)
     _audit_tool_call("dirsearch_tool", context, target=url)
-    return dirsearch_scan(url, args=args)
+    return dirsearch_scan(url, args=_validate_raw_tool_args("dirsearch", args))
 
 
 @_optional_binary_tool("sslyze_tool")
@@ -1269,19 +1638,19 @@ def sslyze_tool(
 
 
 @_optional_binary_tool("smbmap_tool")
-@_instrument_tool("smbmap_tool", "active")
+@_instrument_tool("smbmap_tool", "intrusive")
 def smbmap_tool(
     host: str,
     args: list[str] | None = None,
     engagement_id: str | None = None,
-    engagement_mode: EngagementMode = "active",
+    engagement_mode: EngagementMode = "intrusive",
     auth_token: str | None = None,
 ) -> dict:
     """Run SMB share enumeration with smbmap."""
-    context = _authorize("smbmap_tool", "active", engagement_id, engagement_mode, auth_token)
+    context = _authorize("smbmap_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     policy.validate_target(host)
     _audit_tool_call("smbmap_tool", context, target=host)
-    return smbmap_scan(host, args=args)
+    return smbmap_scan(host, args=_validate_raw_tool_args("smbmap", args))
 
 
 @_optional_binary_tool("smbclient_tool")
@@ -1300,17 +1669,28 @@ def smbclient_tool(
 
 
 @_optional_binary_tool("rpcclient_tool")
-@_instrument_tool("rpcclient_tool", "active")
+@_instrument_tool("rpcclient_tool", "intrusive")
 def rpcclient_tool(
     host: str,
     command: str = "enumdomusers",
     engagement_id: str | None = None,
-    engagement_mode: EngagementMode = "active",
+    engagement_mode: EngagementMode = "intrusive",
     auth_token: str | None = None,
 ) -> dict:
     """Query MSRPC endpoints with rpcclient."""
-    context = _authorize("rpcclient_tool", "active", engagement_id, engagement_mode, auth_token)
+    context = _authorize("rpcclient_tool", "intrusive", engagement_id, engagement_mode, auth_token)
     policy.validate_target(host)
+    if command not in {
+        "enumdomgroups",
+        "enumdomusers",
+        "enumprinters",
+        "getdompwinfo",
+        "lsaquery",
+        "netshareenum",
+        "querydominfo",
+        "srvinfo",
+    }:
+        raise ValueError("Unsupported rpcclient command")
     _audit_tool_call("rpcclient_tool", context, target=host)
     return rpcclient_query(host, command=command)
 
@@ -1325,6 +1705,8 @@ def searchsploit_tool(
 ) -> dict:
     """Search for exploits in the local Exploit Database mirror."""
     context = _authorize("searchsploit_tool", "passive", engagement_id, engagement_mode, auth_token)
+    if not query.strip() or query.lstrip().startswith("-") or len(query) > 256:
+        raise ValueError("Invalid searchsploit query")
     _audit_tool_call("searchsploit_tool", context, target=query)
     return searchsploit_query(query)
 
@@ -1570,8 +1952,31 @@ def runtime_probe_tool(
         "uptime_seconds": int((datetime.now(UTC) - STARTED_AT).total_seconds()),
         "transport_mode": TRANSPORT_MODE,
         "auth_mode": AUTH_MODE,
-        "tool_count_enabled": len(ENABLED_BINARY_MCP_TOOLS) + 16,
+        "tool_count_enabled": sum(
+            1
+            for item in TOOL_MANIFEST.export(server_version=__version__)["tools"]
+            if item["available"]
+        ),
     }
+
+
+@mcp.tool()
+@_instrument_tool("tool_manifest_tool", "passive")
+def tool_manifest_tool(
+    engagement_id: str | None = None,
+    engagement_mode: EngagementMode = "passive",
+    auth_token: str | None = None,
+) -> dict:
+    """Return versioned security metadata for the complete tool catalog."""
+    context = _authorize(
+        "tool_manifest_tool",
+        "passive",
+        engagement_id,
+        engagement_mode,
+        auth_token,
+    )
+    _audit_tool_call("tool_manifest_tool", context)
+    return TOOL_MANIFEST.export(server_version=__version__)
 
 
 @mcp.tool()
@@ -1591,11 +1996,19 @@ def server_health_tool(
             "connect_timeout_ms": cfg.connect_timeout_ms,
             "max_concurrent_connects": cfg.max_concurrent_connects,
             "allow_private_only": cfg.allow_private_only,
-            "allowed_cidrs": [str(cidr) for cidr in cfg.allowed_cidrs],
-            "allowed_domains": list(cfg.allowed_domains),
+            "allowed_cidr_count": len(cfg.allowed_cidrs),
+            "allowed_domain_count": len(cfg.allowed_domains),
             "blocked_ports": list(cfg.blocked_ports),
             "require_engagement_context": cfg.require_engagement_context,
             "max_tool_level": cfg.max_tool_level,
+            "allowed_capabilities": list(cfg.allowed_capabilities),
+            "allow_raw_tools": cfg.allow_raw_tools,
+            "require_routed_execution": cfg.require_routed_execution,
+            "allowed_path_count": len(cfg.allowed_paths),
+            "forbidden_path_count": len(cfg.forbidden_paths),
+            "allowed_resource_count": len(cfg.allowed_resources),
+            "engagement_policy_enabled": cfg.engagement_policy_file is not None,
+            "allow_unscoped_intrusive": cfg.allow_unscoped_intrusive,
             "transport_mode": TRANSPORT_MODE,
             "auth_mode": AUTH_MODE,
             "audit_sink_path": AUDIT_SINK_PATH or None,
@@ -1621,6 +2034,47 @@ def server_health_tool(
 _register_dynamic_kali_raw_tools()
 
 
+class _BearerAuthMiddleware:
+    def __init__(self, app: Any, token: str) -> None:
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = {
+            key.lower(): value
+            for key, value in scope.get("headers", ())
+        }
+        expected = f"Bearer {self.token}".encode()
+        supplied = headers.get(b"authorization", b"")
+        if not hmac.compare_digest(supplied, expected):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"cache-control", b"no-store"),
+                        (b"www-authenticate", b"Bearer"),
+                    ],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'{"error":"authentication required"}',
+                }
+            )
+            return
+        context_token = _transport_authenticated.set(True)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _transport_authenticated.reset(context_token)
+
+
 def main() -> None:
     if "--version" in sys.argv:
         print(f"GhostMCP v{__version__}")
@@ -1628,6 +2082,7 @@ def main() -> None:
 
     _validate_runtime_security()
     _validate_transport_auth_configuration()
+    _initialize_audit_chain()
     _install_signal_handlers()
     enabled_bins = sorted(
         {
@@ -1672,7 +2127,9 @@ def main() -> None:
         else:
             import uvicorn
 
-            app = mcp.streamable_http_app()
+            app: Any = mcp.streamable_http_app()
+            if AUTH_MODE == "token":
+                app = _BearerAuthMiddleware(app, AUTH_TOKEN)
             uvicorn_kwargs: dict[str, Any] = {
                 "host": HTTP_HOST,
                 "port": HTTP_PORT,
@@ -1685,6 +2142,13 @@ def main() -> None:
                         "ssl_certfile": MTLS_CERT,
                         "ssl_ca_certs": MTLS_CA_CERT,
                         "ssl_cert_reqs": ssl.CERT_REQUIRED,
+                    }
+                )
+            elif AUTH_MODE == "token" and TLS_CERT and TLS_KEY:
+                uvicorn_kwargs.update(
+                    {
+                        "ssl_keyfile": TLS_KEY,
+                        "ssl_certfile": TLS_CERT,
                     }
                 )
             config = uvicorn.Config(app, **uvicorn_kwargs)

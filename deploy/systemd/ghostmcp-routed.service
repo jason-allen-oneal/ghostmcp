@@ -1,7 +1,8 @@
 [Unit]
-Description=GhostMCP Server
-After=network-online.target
+Description=GhostMCP Server (Tor-routed external tools)
+After=network-online.target tor@default.service
 Wants=network-online.target
+Requires=tor@default.service
 
 [Service]
 Type=simple
@@ -9,6 +10,8 @@ User=ghostmcp
 Group=ghostmcp
 WorkingDirectory=/opt/ghostmcp
 EnvironmentFile=/etc/ghostmcp/ghostmcp.env
+Environment=GHOSTMCP_PROXY_MODE=tor
+Environment=GHOSTMCP_REQUIRE_ROUTED_EXECUTION=true
 Environment=GHOSTMCP_CREDENTIAL_STORE=/var/lib/ghostmcp/credentials.bin
 Environment=GHOSTMCP_DB_PATH=/var/lib/ghostmcp/ghostmcp.db
 Environment=GHOSTMCP_AUDIT_SINK_PATH=/var/log/ghostmcp/audit.jsonl

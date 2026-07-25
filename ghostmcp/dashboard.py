@@ -1,17 +1,91 @@
 """Web dashboard for GhostMCP - FastAPI + HTMX."""
 
+import base64
+import hmac
+import html
 import json
+import os
 import uuid
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .database import get_database
 
 app = FastAPI(title="GhostMCP Dashboard", version="1.0.0")
+
+
+def _dashboard_credentials() -> tuple[str, str, str]:
+    return (
+        os.getenv("GHOSTMCP_DASHBOARD_AUTH_USERNAME", "ghostmcp"),
+        os.getenv("GHOSTMCP_DASHBOARD_AUTH_PASSWORD", ""),
+        os.getenv("GHOSTMCP_DASHBOARD_AUTH_TOKEN", ""),
+    )
+
+
+def _authorized_request(request: Request) -> tuple[bool, str | None]:
+    username, password, token = _dashboard_credentials()
+    auth = request.headers.get("authorization", "")
+    if token and auth.startswith("Bearer "):
+        supplied = auth.removeprefix("Bearer ").strip()
+        return hmac.compare_digest(supplied, token), "bearer"
+    if password and auth.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(
+                auth.removeprefix("Basic ").strip(),
+                validate=True,
+            ).decode("utf-8")
+            supplied_user, supplied_password = decoded.split(":", 1)
+        except (ValueError, UnicodeDecodeError):
+            return False, None
+        return (
+            hmac.compare_digest(supplied_user, username)
+            and hmac.compare_digest(supplied_password, password),
+            "basic",
+        )
+    return False, None
+
+
+@app.middleware("http")
+async def secure_dashboard(request: Request, call_next) -> Response:
+    _username, password, token = _dashboard_credentials()
+    if not password and not token:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": (
+                    "Dashboard is locked. Configure dashboard authentication."
+                )
+            },
+        )
+    authorized, auth_type = _authorized_request(request)
+    if not authorized:
+        return JSONResponse(
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="GhostMCP"'},
+            content={"detail": "Authentication required"},
+        )
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and auth_type == "basic":
+        origin = request.headers.get("origin")
+        if not origin or urlsplit(origin).netloc != request.headers.get("host"):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "Cross-origin write request denied"},
+            )
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+    )
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
 
 # Templates
 template_dir = Path(__file__).parent / "templates"
@@ -482,14 +556,11 @@ def generate_markdown_report(data: dict) -> str:
 def generate_html_report(data: dict) -> str:
     """Generate HTML report."""
     md = generate_markdown_report(data)
-    # Simple markdown to HTML conversion
-    html = md.replace("\n", "<br>")
-    html = html.replace("# ", "<h1>").replace("## ", "<h2>").replace("### ", "<h3>")
-    html = html.replace("**", "<strong>").replace("* ", "<li>")
+    escaped = html.escape(md)
     return f"""<!DOCTYPE html>
 <html>
 <head>
-    <title>{data['engagement']['name']} - Report</title>
+    <title>GhostMCP Security Assessment Report</title>
     <style>
         body {{ font-family: sans-serif; max-width: 800px; margin: 2rem auto; padding: 1rem; }}
         h1, h2, h3 {{ color: #333; }}
@@ -501,7 +572,7 @@ def generate_html_report(data: dict) -> str:
     </style>
 </head>
 <body>
-{html}
+<pre>{escaped}</pre>
 </body>
 </html>"""
 
