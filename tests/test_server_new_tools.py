@@ -252,7 +252,7 @@ class NewServerToolsTests(unittest.TestCase):
                 server_cfg,
                 require_engagement_context=False,
                 max_tool_level="intrusive",
-                allowed_paths=(Path("/usr/share/dirb/wordlists"),),
+                allowed_paths=(Path("/usr/share/wordlists/dirb").resolve(),),
                 allow_unscoped_intrusive=True,
             ),
         ):
